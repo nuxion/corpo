@@ -1,0 +1,14 @@
+[tools]
+python = "3.12"
+# python = "{{ get_env(name='PYTHON_VERSION', default='3.11') }}"
+ruff = "latest"
+[settings]
+# python.uv_venv_auto = true
+# alternative to python.uv_venv_auto
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Install dependencies"
+alias = "i"
+run = "uv sync"
