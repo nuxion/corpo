@@ -486,3 +486,5 @@ test_app/
 *.sqlite
 frontend/*
 backend/*
+frontend*
+backend*
