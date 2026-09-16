@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +18,21 @@ from azure.devops.connection import Connection
 from msrest.authentication import BasicAuthentication
 
 
-DEFAULT_ORG = "https://dev.azure.com/example-org"
-DEFAULT_PROJECT = "example-project"
+# Org/project and repo/pipeline names are environment-specific and MUST NOT
+# be hard-coded. Set them in .envrc (gitignored) alongside AZDO_PAT.
+DEFAULT_ORG = os.environ.get("AZDO_ORG", "https://dev.azure.com/<org>")
+DEFAULT_PROJECT = os.environ.get("AZDO_PROJECT", "<project>")
+
+BACKEND_REPO = os.environ.get("AZDO_BACKEND_REPO", "")
+FRONTEND_REPO = os.environ.get("AZDO_FRONTEND_REPO", "")
+BACKEND_RELEASE_DEF = os.environ.get("AZDO_BACKEND_RELEASE_DEF", "")
+FRONTEND_RELEASE_DEF = os.environ.get("AZDO_FRONTEND_RELEASE_DEF", "")
+DEV_BRANCH = "dev"
+
+REPO_TO_RELEASE_DEF: dict[str, tuple[str, str]] = {
+    BACKEND_REPO: ("Backend", BACKEND_RELEASE_DEF),
+    FRONTEND_REPO: ("Frontend", FRONTEND_RELEASE_DEF),
+}
 
 
 def slugify(text: str, max_len: int = 80) -> str:
@@ -308,6 +322,84 @@ def render_story_md(
     return "\n".join(lines)
 
 
+def _suite_parent_id(suite: Any) -> int | None:
+    parent = getattr(suite, "parent_suite", None)
+    if parent is None:
+        return None
+    pid = getattr(parent, "id", None)
+    if pid is None and isinstance(parent, dict):
+        pid = parent.get("id")
+    try:
+        return int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_suite_tree(suites: list[Any]) -> tuple[dict[int, list[Any]], list[Any]]:
+    """Return (children_by_parent_id, roots). Roots are suites with no parent in the set."""
+    by_id = {s.id: s for s in suites}
+    children: dict[int, list[Any]] = {}
+    roots: list[Any] = []
+    for s in suites:
+        pid = _suite_parent_id(s)
+        if pid is None or pid not in by_id:
+            roots.append(s)
+        else:
+            children.setdefault(pid, []).append(s)
+    for lst in children.values():
+        lst.sort(key=lambda x: (getattr(x, "name", "") or "").lower())
+    roots.sort(key=lambda x: (getattr(x, "name", "") or "").lower())
+    return children, roots
+
+
+def _print_suite_tree(
+    suite: Any,
+    children: dict[int, list[Any]],
+    prefix: str,
+    is_last: bool,
+    is_root: bool,
+) -> None:
+    stype = getattr(suite, "suite_type", "") or ""
+    marker = "[F]" if "static" in stype.lower() else "[S]"
+    name = getattr(suite, "name", "") or ""
+    if is_root:
+        print(f"{marker} {suite.id}  {name}  ({stype})")
+        new_prefix = ""
+    else:
+        connector = "└── " if is_last else "├── "
+        print(f"{prefix}{connector}{marker} {suite.id}  {name}  ({stype})")
+        new_prefix = prefix + ("    " if is_last else "│   ")
+    kids = children.get(suite.id, [])
+    for i, kid in enumerate(kids):
+        _print_suite_tree(kid, children, new_prefix, i == len(kids) - 1, False)
+
+
+def cmd_show_plan(args: argparse.Namespace) -> int:
+    pat = get_pat()
+    _, client, _ = get_clients(args.org, pat)
+
+    print(f"Fetching suites for plan {args.plan_id} in project {args.project}...")
+    suites = list_suites(client, args.project, args.plan_id)
+    print(f"  {len(suites)} suites found\n")
+
+    children, roots = _build_suite_tree(suites)
+
+    if args.folder_id:
+        by_id = {s.id: s for s in suites}
+        start = by_id.get(args.folder_id)
+        if start is None:
+            print(f"ERROR: folder/suite id {args.folder_id} not found in plan {args.plan_id}", file=sys.stderr)
+            return 1
+        _print_suite_tree(start, children, "", True, True)
+    else:
+        for i, root in enumerate(roots):
+            _print_suite_tree(root, children, "", i == len(roots) - 1, True)
+
+    print()
+    print("Legend: [F] folder/static suite · [S] other suite type")
+    return 0
+
+
 def cmd_show_story(args: argparse.Namespace) -> int:
     data = json.loads(Path(args.json).read_text())
     matches = [c for c in data if c.get("parent_id") == args.story_id]
@@ -448,6 +540,309 @@ def write_story_index(
     (md_dir / "story-index.md").write_text("\n".join(lines))
 
 
+CHILD_REL = "System.LinkTypes.Hierarchy-Forward"
+
+
+def collect_descendant_pr_refs(
+    wit_client, root_id: int, max_depth: int = 4
+) -> tuple[list[tuple[str, str, int]], list[int]]:
+    """Walk the story and its descendant work items, collecting PR ArtifactLinks.
+
+    Returns (pr_refs, visited_ids). Most PRs are linked to child Tasks/Bugs
+    rather than the User Story itself, so we have to traverse the hierarchy.
+    """
+    visited: set[int] = set()
+    pr_refs: list[tuple[str, str, int]] = []
+    seen_refs: set[tuple[str, str, int]] = set()
+    frontier = [root_id]
+    depth = 0
+    while frontier and depth <= max_depth:
+        batch = [i for i in frontier if i not in visited]
+        for i in batch:
+            visited.add(i)
+        frontier = []
+        if not batch:
+            break
+        # ADO caps get_work_items at 200 ids per call.
+        for i in range(0, len(batch), 200):
+            chunk = batch[i : i + 200]
+            try:
+                items = wit_client.get_work_items(ids=chunk, expand="Relations")
+            except Exception:
+                continue
+            for wi in items:
+                for rel in wi.relations or []:
+                    if rel.rel == CHILD_REL:
+                        try:
+                            cid = int((rel.url or "").rstrip("/").split("/")[-1])
+                            if cid not in visited:
+                                frontier.append(cid)
+                        except ValueError:
+                            pass
+                    elif rel.rel == "ArtifactLink":
+                        parsed = parse_pr_artifact_url(rel.url or "")
+                        if parsed and parsed not in seen_refs:
+                            seen_refs.add(parsed)
+                            pr_refs.append(parsed)
+        depth += 1
+    return pr_refs, sorted(visited)
+
+
+def parse_pr_artifact_url(url: str) -> tuple[str, str, int] | None:
+    # vstfs:///Git/PullRequestId/{projectId}%2F{repoId}%2F{prId}
+    if not url or "PullRequestId" not in url:
+        return None
+    tail = url.split("PullRequestId/", 1)[1]
+    decoded = urllib.parse.unquote(tail)
+    parts = decoded.split("/")
+    if len(parts) < 3:
+        return None
+    try:
+        return parts[0], parts[1], int(parts[2])
+    except ValueError:
+        return None
+
+
+def _is_ancestor(git_client, project: str, repo_id: str, ancestor_sha: str, descendant_sha: str) -> bool:
+    """True if ancestor_sha is reachable from descendant_sha via merge-base."""
+    if not ancestor_sha or not descendant_sha:
+        return False
+    if ancestor_sha[:8] == descendant_sha[:8]:
+        return True
+    try:
+        bases = git_client.get_merge_bases(
+            repository_name_or_id=repo_id,
+            commit_id=descendant_sha,
+            other_commit_id=ancestor_sha,
+            project=project,
+        )
+    except Exception:
+        return False
+    for b in bases or []:
+        bid = getattr(b, "commit_id", None) or (b.get("commitId") if isinstance(b, dict) else None)
+        if bid and bid[:8] == ancestor_sha[:8]:
+            return True
+    return False
+
+
+def _artifact_source_commit(artifact: Any) -> str | None:
+    dr = getattr(artifact, "definition_reference", None)
+    if not dr or not isinstance(dr, dict):
+        return None
+    src = dr.get("sourceVersion")
+    if src is None:
+        return None
+    cid = getattr(src, "id", None)
+    if cid is None and isinstance(src, dict):
+        cid = src.get("id")
+    return cid or None
+
+
+def cmd_story_status(args: argparse.Namespace) -> int:
+    pat = get_pat()
+    conn = Connection(base_url=args.org, creds=BasicAuthentication("", pat))
+    wit_client = conn.clients_v7_1.get_work_item_tracking_client()
+    git_client = conn.clients_v7_1.get_git_client()
+    release_client = conn.clients.get_release_client()
+
+    try:
+        wi = wit_client.get_work_item(id=args.story_id, expand="Relations")
+    except Exception as e:
+        print(f"ERROR: failed to fetch work item {args.story_id}: {e}", file=sys.stderr)
+        return 1
+
+    f = wi.fields or {}
+    title = f.get("System.Title", "")
+    state = f.get("System.State", "")
+    wi_type = f.get("System.WorkItemType", "")
+    assigned = f.get("System.AssignedTo")
+    if isinstance(assigned, dict):
+        assigned = assigned.get("displayName")
+    iteration = f.get("System.IterationPath", "")
+    wi_url = f"{args.org}/{args.project}/_workitems/edit/{args.story_id}"
+
+    print("=" * 72)
+    print(f"Story {args.story_id}: {title}")
+    print("=" * 72)
+    print(f"  Type:       {wi_type}")
+    print(f"  State:      {state}")
+    print(f"  Assigned:   {assigned or '_unassigned_'}")
+    print(f"  Iteration:  {iteration}")
+    print(f"  URL:        {wi_url}")
+    print()
+
+    verbose = bool(getattr(args, "verbose", False))
+
+    def vprint(*a, **kw):
+        if verbose:
+            print(*a, **kw)
+
+    pr_refs, visited_ids = collect_descendant_pr_refs(wit_client, args.story_id)
+    vprint(f"Linked Pull Requests ({len(pr_refs)}) — walked {len(visited_ids)} work item(s)")
+    vprint("-" * 72)
+    pr_details_by_repo: dict[str, list[dict[str, Any]]] = {}
+    if verbose and not pr_refs:
+        vprint("  _none found_")
+    for project_id, _, pr_id in pr_refs:
+        try:
+            pr = git_client.get_pull_request_by_id(pull_request_id=pr_id, project=project_id)
+        except Exception as e:
+            vprint(f"  PR {pr_id}: error fetching ({e})")
+            continue
+        repo_name = getattr(getattr(pr, "repository", None), "name", "?") or "?"
+        target = (pr.target_ref_name or "").replace("refs/heads/", "")
+        source = (pr.source_ref_name or "").replace("refs/heads/", "")
+        status = pr.status
+        closed = pr.closed_date
+        merge_commit = getattr(pr, "last_merge_commit", None)
+        merge_sha = getattr(merge_commit, "commit_id", None) if merge_commit else None
+        merged_to_dev = status == "completed" and target == DEV_BRANCH
+        marker = "✓ merged→dev" if merged_to_dev else f"{status} → {target}"
+        vprint(f"  [{repo_name}] PR !{pr_id}: {pr.title}")
+        vprint(f"      {source} → {target}  [{marker}]  closed={closed}")
+        if merge_sha:
+            vprint(f"      merge commit: {merge_sha}")
+        vprint(f"      url: {args.org}/{args.project}/_git/{repo_name}/pullrequest/{pr_id}")
+        pr_details_by_repo.setdefault(repo_name, []).append({
+            "pr_id": pr_id,
+            "status": status,
+            "target": target,
+            "merge_sha": merge_sha,
+            "merged_to_dev": merged_to_dev,
+        })
+    vprint()
+
+    vprint("Release Pipelines")
+    vprint("-" * 72)
+    deploy_summary: dict[str, dict[str, str]] = {}
+    for repo_name, (label, def_name) in REPO_TO_RELEASE_DEF.items():
+        vprint(f"\n  {label} — {def_name}  (repo: {repo_name})")
+        try:
+            defs = release_client.get_release_definitions(project=args.project, search_text=def_name)
+        except Exception as e:
+            vprint(f"    error fetching definitions: {e}")
+            continue
+        match = next((d for d in defs if d.name == def_name), None)
+        if not match:
+            vprint(f"    definition '{def_name}' not found")
+            continue
+        try:
+            releases = release_client.get_releases(
+                project=args.project,
+                definition_id=match.id,
+                top=args.releases_top,
+                expand="environments,artifacts",
+            )
+        except Exception as e:
+            vprint(f"    error fetching releases: {e}")
+            continue
+
+        merge_shas = [
+            p["merge_sha"] for p in pr_details_by_repo.get(repo_name, []) if p.get("merge_sha")
+        ]
+
+        if not releases:
+            vprint("    _no releases found_")
+            continue
+
+        repo_id: str | None = None
+        if merge_shas:
+            try:
+                repo = git_client.get_repository(repository_id=repo_name, project=args.project)
+                repo_id = getattr(repo, "id", None)
+            except Exception as e:
+                vprint(f"    warning: could not resolve repo id for ancestry check ({e})")
+
+        # Track latest *succeeded* deployment per environment (releases come back desc by id).
+        env_latest: dict[str, dict[str, Any]] = {}
+        for rel in releases:
+            envs = getattr(rel, "environments", None) or []
+            env_summary = ", ".join(f"{e.name}={e.status}" for e in envs) or "_no envs_"
+            artifacts = getattr(rel, "artifacts", None) or []
+            commits = [c for c in (_artifact_source_commit(a) for a in artifacts) if c]
+            deployed = ""
+            includes_story = False
+            if repo_id and commits and merge_shas:
+                for c in commits:
+                    if any(_is_ancestor(git_client, args.project, repo_id, m, c) for m in merge_shas):
+                        deployed = "  ← includes story PR merge commit (ancestor)"
+                        includes_story = True
+                        break
+            vprint(f"    R{rel.id} {rel.name}  [{rel.status}]  {env_summary}{deployed}")
+            for c in commits:
+                vprint(f"      source: {c}")
+            for env in envs:
+                if env.status == "succeeded" and env.name not in env_latest:
+                    env_latest[env.name] = {
+                        "release_id": rel.id,
+                        "release_name": rel.name,
+                        "commits": commits,
+                        "includes_story": includes_story,
+                        "deployed_on": (
+                            getattr(env, "time_to_deploy", None)
+                            or getattr(env, "modified_on", None)
+                            or getattr(env, "time_started", None)
+                            or (rel.created_on if hasattr(rel, "created_on") else None)
+                        ),
+                    }
+
+        vprint("\n    Latest succeeded deployment per environment:")
+        if verbose and not env_latest:
+            vprint(f"      _no successful deployments in last {args.releases_top} releases_")
+        env_summary_for_repo: dict[str, str] = {}
+        for env_name in sorted(env_latest.keys()):
+            info = env_latest[env_name]
+            mark = "  ✓ includes story" if info["includes_story"] else ""
+            ts = info["deployed_on"]
+            commit_short = (info["commits"][0][:8] + "…") if info["commits"] else "?"
+            vprint(f"      {env_name:<6} R{info['release_id']} {info['release_name']}  commit={commit_short}  at={ts}{mark}")
+            env_summary_for_repo[env_name] = "✓story" if info["includes_story"] else "-"
+        deploy_summary[label] = env_summary_for_repo
+
+    if verbose:
+        print()
+        print("=" * 72)
+        print("Summary")
+        print("=" * 72)
+    if not pr_refs:
+        print("  Code merged to dev: UNKNOWN (no linked PRs found on story or descendants)")
+    else:
+        for repo_name, (label, _) in REPO_TO_RELEASE_DEF.items():
+            prs = pr_details_by_repo.get(repo_name, [])
+            if not prs:
+                print(f"  {label} merged to dev: NO PRs FOUND")
+                continue
+            merged_dev = [p for p in prs if p.get("merged_to_dev")]
+            other_completed = [
+                p for p in prs
+                if p.get("status") == "completed" and not p.get("merged_to_dev")
+            ]
+            active = [p for p in prs if p.get("status") == "active"]
+            abandoned = [p for p in prs if p.get("status") == "abandoned"]
+            verdict = "YES" if merged_dev else "NO"
+            parts = [f"{len(merged_dev)} merged→dev"]
+            if other_completed:
+                targets = ", ".join(sorted({p["target"] for p in other_completed}))
+                parts.append(f"{len(other_completed)} merged to other branches ({targets})")
+            if active:
+                parts.append(f"{len(active)} still active")
+            if abandoned:
+                parts.append(f"{len(abandoned)} abandoned")
+            print(f"  {label} merged to dev: {verdict} — {len(prs)} PR(s): {'; '.join(parts)}")
+    for label, envs in deploy_summary.items():
+        if not envs:
+            print(f"  {label} deployments: _no successful deployments seen_")
+            continue
+        story_envs = [e for e, v in envs.items() if v == "✓story"]
+        if story_envs:
+            print(f"  {label} environments containing this story: {', '.join(sorted(story_envs))}")
+        else:
+            envs_list = ", ".join(sorted(envs.keys()))
+            print(f"  {label} latest succeeded envs: {envs_list}  (story PR not detected — see --verbose for PR list)")
+
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="fetch_test_plan")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -469,6 +864,38 @@ def main() -> int:
         help="Also write story-<id>-<title>.md (story definition) inside each story folder. Requires --group-by-story.",
     )
     f.set_defaults(func=cmd_fetch)
+
+    sp = sub.add_parser("show-plan", help="Show plan suite hierarchy (folders and test suites).")
+    sp.add_argument("--plan-id", type=int, required=True)
+    sp.add_argument("--project", default=DEFAULT_PROJECT)
+    sp.add_argument("--org", default=DEFAULT_ORG)
+    sp.add_argument(
+        "--folder-id",
+        type=int,
+        default=None,
+        help="Show only the subtree rooted at this folder/suite id.",
+    )
+    sp.set_defaults(func=cmd_show_plan)
+
+    ss = sub.add_parser(
+        "story-status",
+        help="Show story state, linked PRs (merged-to-dev?) and recent release pipeline status.",
+    )
+    ss.add_argument("story_id", type=int)
+    ss.add_argument("--project", default=DEFAULT_PROJECT)
+    ss.add_argument("--org", default=DEFAULT_ORG)
+    ss.add_argument(
+        "--releases-top",
+        type=int,
+        default=5,
+        help="How many recent releases to inspect per pipeline (default: 5).",
+    )
+    ss.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show full PR list and per-release detail. Default output is a 1-line summary per repo.",
+    )
+    ss.set_defaults(func=cmd_story_status)
 
     s = sub.add_parser("show-story", help="List test cases for one user story from a JSON dump.")
     s.add_argument("story_id", type=int)

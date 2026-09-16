@@ -24,7 +24,11 @@ they relate, see [`test-suite.md`](./test-suite.md).
 uv sync --locked
 ```
 
-### 2. Set your Azure DevOps Personal Access Token
+### 2. Set your Azure DevOps environment
+
+No organization, project, repo, or pipeline names are committed to this
+repo. Supply them through the environment — `.envrc` is gitignored and is
+the intended place for them.
 
 The script reads the PAT from `AZDO_PAT` (preferred) or `PAT`. The
 token needs at least:
@@ -34,29 +38,38 @@ token needs at least:
 
 ```fish
 set -x AZDO_PAT '<your-pat>'
+set -x AZDO_ORG 'https://dev.azure.com/<your-org>'
+set -x AZDO_PROJECT '<your-project>'
+
+# Optional — only needed for the repo/release commands
+set -x AZDO_BACKEND_REPO '<backend-repo-name>'
+set -x AZDO_FRONTEND_REPO '<frontend-repo-name>'
+set -x AZDO_BACKEND_RELEASE_DEF '<backend-release-definition>'
+set -x AZDO_FRONTEND_RELEASE_DEF '<frontend-release-definition>'
 ```
 
-### 3. PYTHONPATH
-
-The package lives at `ado_actions/ado_actions/`, so the outer
-directory must be on `sys.path`:
-
-```fish
-set -x PYTHONPATH ado_actions
-```
-
-(Or prefix individual commands with `PYTHONPATH=ado_actions`.)
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `AZDO_PAT` (or `PAT`) | yes | Personal Access Token |
+| `AZDO_ORG` | yes | Org URL; default is the `<org>` placeholder |
+| `AZDO_PROJECT` | yes | Project name |
+| `AZDO_BACKEND_REPO` / `AZDO_FRONTEND_REPO` | for repo cmds | Git repo names |
+| `AZDO_BACKEND_RELEASE_DEF` / `AZDO_FRONTEND_RELEASE_DEF` | for release cmds | Release pipeline names |
 
 ## Running
 
-The CLI uses two subcommands: `fetch` and `show-story`.
+The package installs an `ado` console script (see
+`[project.scripts]` in `pyproject.toml`). Run it with `uv run ado` or,
+after `uv sync`, directly as `ado`.
+
+The CLI has three subcommands: `fetch`, `show-plan`, and `show-story`.
 
 ### Fetch a whole plan
 
 Basic — flat output, one markdown per test case:
 
 ```fish
-uv run python -m ado_actions.fetch_test_plan fetch --plan-id 1001
+uv run ado fetch --plan-id 1001
 ```
 
 Group cases by their parent User Story (uses the `TestedBy` work item
@@ -64,7 +77,7 @@ relation), write a `story-index.md`, and pull the User Story
 definition into each story folder:
 
 ```fish
-uv run python -m ado_actions.fetch_test_plan fetch \
+uv run ado fetch \
   --plan-id 1001 \
   --md-dir tests2/plan-1001 \
   --group-by-story \
@@ -89,12 +102,31 @@ Flags:
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--plan-id` | _(required)_ | Test Plan ID |
-| `--project` | `example-project` | ADO project name |
-| `--org` | `https://dev.azure.com/example-org` | Org URL |
+| `--project` | `$AZDO_PROJECT` | ADO project name |
+| `--org` | `$AZDO_ORG` | Org URL |
 | `--out-json` | `test_cases_plan_<planId>.json` | JSON dump path |
 | `--md-dir` | `tests/plan-<planId>` | Root markdown directory |
 | `--group-by-story` | off | Subdirs `story-<parentId>/` via TestedBy relation |
 | `--include-story` | off | Also write the User Story definition (requires `--group-by-story`) |
+
+### Show the suite hierarchy of a plan
+
+Print the folder/suite tree of a plan without fetching test cases —
+useful for finding a `--folder-id` to scope a later run, or just
+auditing how a plan is organised:
+
+```fish
+uv run ado show-plan --plan-id 1001
+```
+
+Limit the tree to one subtree:
+
+```fish
+uv run ado show-plan --plan-id 1001 --folder-id 2004
+```
+
+Each line is prefixed with `[F]` for folder/static suites and `[S]`
+for other suite types.
 
 ### Inspect a single User Story from the JSON
 
@@ -102,7 +134,7 @@ After running `fetch`, query the resulting JSON for one story without
 hitting the API again:
 
 ```fish
-uv run python -m ado_actions.fetch_test_plan show-story 11336 \
+uv run ado show-story 11336 \
   --json test_cases_plan_1001.json
 ```
 
@@ -114,13 +146,6 @@ Story 11336: Export Requests to Excel (model+support)
    12877  [Design    ] 11336- Verify Export button is available on Model Requests dashboard
    12878  [Design    ] 11336- Verify Export button is available on Support Requests dashboard
    …
-```
-
-### One-liner without exporting PYTHONPATH
-
-```fish
-PYTHONPATH=ado_actions uv run python -m ado_actions.fetch_test_plan fetch \
-  --plan-id 1001 --group-by-story --include-story
 ```
 
 

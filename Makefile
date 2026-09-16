@@ -10,6 +10,7 @@ Commands:
 	release   Publish docker image based on some variables
 	docker    Build the docker image
 	tag    	  Make a git tab using poetry information
+	zipapps   Build standalone `board` and `pipeline` executables with shiv
 
 endef
 
@@ -63,6 +64,27 @@ test:
 .PHONY: docs-server
 docs-serve:
 	hatch run sphinx-autobuild docs/source docs/build/html --port 9292 --watch ./
+
+## Standalone single-file executables (shiv)
+
+SHIV_PYTHON ?= /usr/bin/env python3
+SHIV_OUT ?= dist
+
+.PHONY: zipapps board-zipapp pipeline-zipapp
+zipapps: board-zipapp pipeline-zipapp
+
+board-zipapp:
+	mkdir -p $(SHIV_OUT)
+	uv run shiv -c board -o $(SHIV_OUT)/board -p "$(SHIV_PYTHON)" --compressed .
+
+pipeline-zipapp:
+	mkdir -p $(SHIV_OUT)
+	uv run shiv -c pipeline -o $(SHIV_OUT)/pipeline -p "$(SHIV_PYTHON)" --compressed .
+
+install-zipapps: zipapps
+	mkdir -p $(HOME)/.local/bin
+	install -m 0755 $(SHIV_OUT)/board $(HOME)/.local/bin/board
+	install -m 0755 $(SHIV_OUT)/pipeline $(HOME)/.local/bin/pipeline
 
 ## Standard commands for CI/CD cycle
 
