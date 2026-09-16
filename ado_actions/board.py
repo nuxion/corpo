@@ -596,6 +596,21 @@ def collect_descendants(
     return out
 
 
+def resolve_depth(args: argparse.Namespace) -> int:
+    """How many hierarchy levels the --children/--depth/--recursive flags ask for.
+
+    --recursive wins over --depth, which wins over --children (a shorthand for
+    one level). 0 means "the item itself only".
+    """
+    if getattr(args, "recursive", False):
+        return 100
+    if getattr(args, "depth", None) is not None:
+        return args.depth
+    if getattr(args, "children", False):
+        return 1
+    return 0
+
+
 def cmd_fetch_work(args: argparse.Namespace) -> int:
     try:
         wid, url_org, url_project = parse_work_item_ref(args.ref)
@@ -616,17 +631,7 @@ def cmd_fetch_work(args: argparse.Namespace) -> int:
         print(f"ERROR: cannot fetch work item {wid}: {e}", file=sys.stderr)
         return 1
 
-    # --depth controls how many hierarchy levels to descend; --include-child is
-    # kept as a backward-compatible shorthand for --depth 1; --recursive descends
-    # the whole tree (Epic -> Feature -> User Story -> Task ...).
-    if args.recursive:
-        max_depth = 100
-    elif args.depth is not None:
-        max_depth = args.depth
-    elif args.include_child:
-        max_depth = 1
-    else:
-        max_depth = 0
+    max_depth = resolve_depth(args)
 
     items = [wi]
     if max_depth > 0:
@@ -715,6 +720,382 @@ def cmd_fetch_work(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# work-status: merge & deployment state for any work item (Task, Story, Epic…)
+# ---------------------------------------------------------------------------
+
+
+def build_release_snapshot(
+    release_client, git_client, project: str, releases_top: int
+) -> dict[str, dict[str, Any]]:
+    """Fetch the recent releases of every configured pipeline, once.
+
+    The expensive calls (definition lookup, release list, repo id) do not
+    depend on the work item being inspected, so they are done a single time
+    and reused for the root item and every descendant we report on.
+    """
+    snapshot: dict[str, dict[str, Any]] = {}
+    for repo_name, (label, def_name) in REPO_TO_RELEASE_DEF.items():
+        if not repo_name or not def_name:
+            continue
+        entry: dict[str, Any] = {
+            "label": label,
+            "def_name": def_name,
+            "repo_id": None,
+            "releases": [],
+            "error": None,
+            "warning": None,
+        }
+        snapshot[repo_name] = entry
+        try:
+            defs = release_client.get_release_definitions(project=project, search_text=def_name)
+        except Exception as e:
+            entry["error"] = f"error fetching definitions: {e}"
+            continue
+        match = next((d for d in defs if d.name == def_name), None)
+        if not match:
+            entry["error"] = f"definition '{def_name}' not found"
+            continue
+        try:
+            releases = release_client.get_releases(
+                project=project,
+                definition_id=match.id,
+                top=releases_top,
+                expand="environments,artifacts",
+            )
+        except Exception as e:
+            entry["error"] = f"error fetching releases: {e}"
+            continue
+        try:
+            repo = git_client.get_repository(repository_id=repo_name, project=project)
+            entry["repo_id"] = getattr(repo, "id", None)
+        except Exception as e:
+            entry["warning"] = f"could not resolve repo id for ancestry check ({e})"
+        for rel in releases or []:
+            artifacts = getattr(rel, "artifacts", None) or []
+            entry["releases"].append({
+                "id": rel.id,
+                "name": rel.name,
+                "status": rel.status,
+                "commits": [c for c in (_artifact_source_commit(a) for a in artifacts) if c],
+                "envs": [
+                    {
+                        "name": env.name,
+                        "status": env.status,
+                        "deployed_on": (
+                            getattr(env, "time_to_deploy", None)
+                            or getattr(env, "modified_on", None)
+                            or getattr(env, "time_started", None)
+                            or getattr(rel, "created_on", None)
+                        ),
+                    }
+                    for env in (getattr(rel, "environments", None) or [])
+                ],
+            })
+    return snapshot
+
+
+def _ancestor_cached(
+    git_client,
+    project: str,
+    cache: dict[tuple[str, str, str], bool],
+    repo_id: str,
+    merge_sha: str,
+    commit: str,
+) -> bool:
+    key = (repo_id, merge_sha, commit)
+    if key not in cache:
+        cache[key] = _is_ancestor(git_client, project, repo_id, merge_sha, commit)
+    return cache[key]
+
+
+def collect_pr_details(
+    wit_client,
+    git_client,
+    org_url: str,
+    project: str,
+    root_id: int,
+    out,
+) -> tuple[dict[str, list[dict[str, Any]]], list[tuple[str, str, int]], list[int]]:
+    """Resolve every PR linked to ``root_id`` or any of its descendants.
+
+    ``out`` is a printer (see ``_printer``); it only emits in verbose mode.
+    """
+    pr_refs, visited_ids = collect_descendant_pr_refs(wit_client, root_id)
+    out(f"Linked Pull Requests ({len(pr_refs)}) — walked {len(visited_ids)} work item(s)")
+    out("-" * 60)
+    pr_details_by_repo: dict[str, list[dict[str, Any]]] = {}
+    if not pr_refs:
+        out("  _none found_")
+    for project_id, _, pr_id in pr_refs:
+        try:
+            pr = git_client.get_pull_request_by_id(pull_request_id=pr_id, project=project_id)
+        except Exception as e:
+            out(f"  PR {pr_id}: error fetching ({e})")
+            continue
+        repo_name = getattr(getattr(pr, "repository", None), "name", "?") or "?"
+        target = (pr.target_ref_name or "").replace("refs/heads/", "")
+        source = (pr.source_ref_name or "").replace("refs/heads/", "")
+        status = pr.status
+        merge_commit = getattr(pr, "last_merge_commit", None)
+        merge_sha = getattr(merge_commit, "commit_id", None) if merge_commit else None
+        merged_to_dev = status == "completed" and target == DEV_BRANCH
+        marker = "✓ merged→dev" if merged_to_dev else f"{status} → {target}"
+        out(f"  [{repo_name}] PR !{pr_id}: {pr.title}")
+        out(f"      {source} → {target}  [{marker}]  closed={pr.closed_date}")
+        if merge_sha:
+            out(f"      merge commit: {merge_sha}")
+        out(f"      url: {org_url}/{project}/_git/{repo_name}/pullrequest/{pr_id}")
+        pr_details_by_repo.setdefault(repo_name, []).append({
+            "pr_id": pr_id,
+            "status": status,
+            "target": target,
+            "merge_sha": merge_sha,
+            "merged_to_dev": merged_to_dev,
+        })
+    out("")
+    return pr_details_by_repo, pr_refs, visited_ids
+
+
+def deployment_summary(
+    git_client,
+    project: str,
+    snapshot: dict[str, dict[str, Any]],
+    pr_details_by_repo: dict[str, list[dict[str, Any]]],
+    cache: dict[tuple[str, str, str], bool],
+    out,
+) -> dict[str, dict[str, str]]:
+    """Latest succeeded deployment per environment, flagged when it carries this item."""
+    out("Release Pipelines")
+    out("-" * 60)
+    deploy_summary: dict[str, dict[str, str]] = {}
+    for repo_name, entry in snapshot.items():
+        label = entry["label"]
+        out(f"\n  {label} — {entry['def_name']}  (repo: {repo_name})")
+        if entry["error"]:
+            out(f"    {entry['error']}")
+            continue
+        if entry["warning"]:
+            out(f"    warning: {entry['warning']}")
+        if not entry["releases"]:
+            out("    _no releases found_")
+            continue
+
+        merge_shas = [
+            p["merge_sha"] for p in pr_details_by_repo.get(repo_name, []) if p.get("merge_sha")
+        ]
+        repo_id = entry["repo_id"]
+
+        # Releases come back newest-first, so the first succeeded hit per
+        # environment is that environment's current deployment.
+        env_latest: dict[str, dict[str, Any]] = {}
+        for rel in entry["releases"]:
+            includes_item = False
+            if repo_id and rel["commits"] and merge_shas:
+                includes_item = any(
+                    _ancestor_cached(git_client, project, cache, repo_id, m, c)
+                    for c in rel["commits"]
+                    for m in merge_shas
+                )
+            env_summary = ", ".join(f"{e['name']}={e['status']}" for e in rel["envs"]) or "_no envs_"
+            deployed = "  ← includes this item's PR merge commit (ancestor)" if includes_item else ""
+            out(f"    R{rel['id']} {rel['name']}  [{rel['status']}]  {env_summary}{deployed}")
+            for c in rel["commits"]:
+                out(f"      source: {c}")
+            for env in rel["envs"]:
+                if env["status"] == "succeeded" and env["name"] not in env_latest:
+                    env_latest[env["name"]] = {
+                        "release_id": rel["id"],
+                        "release_name": rel["name"],
+                        "commits": rel["commits"],
+                        "includes_item": includes_item,
+                        "deployed_on": env["deployed_on"],
+                    }
+
+        out("\n    Latest succeeded deployment per environment:")
+        if not env_latest:
+            out("      _no successful deployments in the releases inspected_")
+        env_summary_for_repo: dict[str, str] = {}
+        for env_name in sorted(env_latest):
+            info = env_latest[env_name]
+            mark = "  ✓ includes this item" if info["includes_item"] else ""
+            commit_short = (info["commits"][0][:8] + "…") if info["commits"] else "?"
+            out(
+                f"      {env_name:<6} R{info['release_id']} {info['release_name']}  "
+                f"commit={commit_short}  at={info['deployed_on']}{mark}"
+            )
+            env_summary_for_repo[env_name] = "✓item" if info["includes_item"] else "-"
+        deploy_summary[label] = env_summary_for_repo
+    return deploy_summary
+
+
+def _printer(enabled: bool, indent: str):
+    """Return a print function that indents and can be switched off."""
+
+    def emit(msg: str = "") -> None:
+        if not enabled:
+            return
+        print(f"{indent}{msg}" if msg else "")
+
+    return emit
+
+
+def report_work_item_status(
+    wit_client,
+    git_client,
+    snapshot: dict[str, dict[str, Any]],
+    wi: Any,
+    org_url: str,
+    project: str,
+    verbose: bool,
+    cache: dict[tuple[str, str, str], bool],
+    indent: str = "",
+) -> None:
+    """Print merge + deployment state for one work item and its subtree."""
+    f = wi.fields or {}
+    title = f.get("System.Title", "")
+    wi_type = f.get("System.WorkItemType", "") or "Work Item"
+    state = f.get("System.State", "")
+    assigned = f.get("System.AssignedTo")
+    if isinstance(assigned, dict):
+        assigned = assigned.get("displayName")
+    wi_url = f"{org_url}/{project}/_workitems/edit/{wi.id}"
+
+    if indent:
+        print(f"{indent}{wi_type} {wi.id}: {title}  [{state}]")
+    else:
+        print("=" * 72)
+        print(f"{wi_type} {wi.id}: {title}")
+        print("=" * 72)
+        print(f"  Type:       {wi_type}")
+        print(f"  State:      {state}")
+        print(f"  Assigned:   {assigned or '_unassigned_'}")
+        print(f"  Iteration:  {f.get('System.IterationPath', '')}")
+        print(f"  URL:        {wi_url}")
+        print()
+
+    detail = _printer(verbose, indent)
+    summary = _printer(True, f"{indent}  " if indent else "")
+
+    pr_details_by_repo, pr_refs, _ = collect_pr_details(
+        wit_client, git_client, org_url, project, wi.id, detail
+    )
+    deploy_summary = deployment_summary(
+        git_client, project, snapshot, pr_details_by_repo, cache, detail
+    )
+
+    if verbose:
+        detail("")
+        detail("=" * 60)
+        detail("Summary")
+        detail("=" * 60)
+
+    if not snapshot:
+        summary("  No release pipelines configured "
+                "(set AZDO_BACKEND_REPO / AZDO_FRONTEND_REPO and the *_RELEASE_DEF vars).")
+    if not pr_refs:
+        summary("  Code merged to dev: UNKNOWN (no linked PRs on this item or its descendants)")
+    else:
+        for repo_name, entry in snapshot.items():
+            label = entry["label"]
+            prs = pr_details_by_repo.get(repo_name, [])
+            if not prs:
+                summary(f"  {label} merged to dev: NO PRs FOUND")
+                continue
+            merged_dev = [p for p in prs if p.get("merged_to_dev")]
+            other_completed = [
+                p for p in prs if p.get("status") == "completed" and not p.get("merged_to_dev")
+            ]
+            active = [p for p in prs if p.get("status") == "active"]
+            abandoned = [p for p in prs if p.get("status") == "abandoned"]
+            parts = [f"{len(merged_dev)} merged→dev"]
+            if other_completed:
+                targets = ", ".join(sorted({p["target"] for p in other_completed}))
+                parts.append(f"{len(other_completed)} merged to other branches ({targets})")
+            if active:
+                parts.append(f"{len(active)} still active")
+            if abandoned:
+                parts.append(f"{len(abandoned)} abandoned")
+            verdict = "YES" if merged_dev else "NO"
+            summary(f"  {label} merged to dev: {verdict} — {len(prs)} PR(s): {'; '.join(parts)}")
+
+    # PRs living in repos outside REPO_TO_RELEASE_DEF would otherwise vanish
+    # from the summary — common once you point this at an Epic spanning repos.
+    for repo_name, prs in sorted(pr_details_by_repo.items()):
+        if repo_name in snapshot:
+            continue
+        merged = [p for p in prs if p.get("status") == "completed"]
+        summary(
+            f"  {repo_name} (no release pipeline configured): "
+            f"{len(prs)} PR(s), {len(merged)} completed"
+        )
+
+    for label, envs in deploy_summary.items():
+        if not envs:
+            summary(f"  {label} deployments: _no successful deployments seen_")
+            continue
+        item_envs = [e for e, v in envs.items() if v == "✓item"]
+        if item_envs:
+            summary(f"  {label} environments containing this item: {', '.join(sorted(item_envs))}")
+        else:
+            envs_list = ", ".join(sorted(envs))
+            summary(
+                f"  {label} latest succeeded envs: {envs_list}"
+                "  (item PR not detected — see --verbose for the PR list)"
+            )
+    print()
+
+
+def cmd_work_status(args: argparse.Namespace) -> int:
+    try:
+        wid, url_org, url_project = parse_work_item_ref(args.ref)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    org_url = args.org or url_org or DEFAULT_ORG
+    project = args.project or url_project or DEFAULT_PROJECT
+
+    pat = get_pat()
+    conn = Connection(base_url=org_url, creds=BasicAuthentication("", pat))
+    wit_client = conn.clients_v7_1.get_work_item_tracking_client()
+    git_client = conn.clients_v7_1.get_git_client()
+    release_client = conn.clients.get_release_client()
+
+    try:
+        wi = wit_client.get_work_item(id=wid, project=project, expand="All")
+    except Exception as e:
+        print(f"ERROR: cannot fetch work item {wid}: {e}", file=sys.stderr)
+        return 1
+
+    max_depth = resolve_depth(args)
+
+    snapshot = build_release_snapshot(release_client, git_client, project, args.releases_top)
+    cache: dict[tuple[str, str, str], bool] = {}
+
+    report_work_item_status(
+        wit_client, git_client, snapshot, wi, org_url, project, args.verbose, cache
+    )
+
+    if max_depth > 0:
+        descendants = collect_descendants(wit_client, wi, project, max_depth)
+        print(f"Descendants ({len(descendants)}, depth <= {max_depth})")
+        print("-" * 72)
+        for child, depth in descendants:
+            report_work_item_status(
+                wit_client,
+                git_client,
+                snapshot,
+                child,
+                org_url,
+                project,
+                args.verbose,
+                cache,
+                indent="  " * depth,
+            )
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="board")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -781,7 +1162,9 @@ def main() -> int:
         help="Write the markdown to stdout instead of a file.",
     )
     fw.add_argument(
+        "--children",
         "--include-child",
+        dest="children",
         action="store_true",
         help="Also render the direct children (first level only), e.g. a "
         "Feature's child User Stories. Shorthand for --depth 1.",
@@ -808,6 +1191,57 @@ def main() -> int:
         "Cannot be used with --stdout or --out.",
     )
     fw.set_defaults(func=cmd_fetch_work)
+
+    ws = sub.add_parser(
+        "work-status",
+        help="Show merge & deployment status for any work item (Task, Story, Feature, Epic…).",
+    )
+    ws.add_argument(
+        "ref",
+        help="Work item ID (e.g. 7102940) or full URL "
+        "(e.g. https://dev.azure.com/<org>/<project>/_workitems/edit/7102940).",
+    )
+    ws.add_argument(
+        "--org",
+        default=None,
+        help=f"Override organization URL (default: parsed from URL or {DEFAULT_ORG}).",
+    )
+    ws.add_argument(
+        "--project",
+        default=None,
+        help=f"Override project (default: parsed from URL or {DEFAULT_PROJECT}).",
+    )
+    ws.add_argument(
+        "--children",
+        "--include-child",
+        dest="children",
+        action="store_true",
+        help="Also report each direct child separately. Shorthand for --depth 1.",
+    )
+    ws.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="How many hierarchy levels to report on individually "
+        "(1 = direct children, 2 = also grandchildren). Overrides --children.",
+    )
+    ws.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Report on the entire child hierarchy. Overrides --depth / --children.",
+    )
+    ws.add_argument(
+        "--releases-top",
+        type=int,
+        default=5,
+        help="How many recent releases to inspect per pipeline (default: 5).",
+    )
+    ws.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show the full PR list and per-release detail. Default is a summary per repo.",
+    )
+    ws.set_defaults(func=cmd_work_status)
 
     args = p.parse_args()
     return args.func(args)

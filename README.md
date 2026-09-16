@@ -149,6 +149,48 @@ Story 11336: Export Requests to Excel (model+support)
 ```
 
 
+### Work item status (`board work-status`)
+
+Merge & deployment state for **any** work item — Task, Bug, User Story,
+Feature or Epic. It walks the item's whole subtree for linked Pull
+Requests, checks which ones landed on `dev`, and matches their merge
+commits against the artifacts of recent releases to tell you which
+environments already carry the work.
+
+Takes an id or a full work-item URL (org and project are inferred from
+the URL):
+
+```fish
+uv run board work-status 7638343
+uv run board work-status https://dev.azure.com/<org>/<project>/_workitems/edit/7638343
+```
+
+Report on the hierarchy below the item as well — same flags as
+`board fetch-work`:
+
+```fish
+uv run board work-status 7291258 --children      # each direct child too
+uv run board work-status 7291258 --depth 2       # children and grandchildren
+uv run board work-status 7291258 --recursive     # the whole tree
+```
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `ref` | _(required)_ | Work item id or `_workitems/edit/<id>` URL |
+| `--org` / `--project` | parsed from the URL, else env | Override the inferred context |
+| `--children` | off | Also report each direct child (alias `--include-child`) |
+| `--depth N` | — | Report N levels down; overrides `--children` |
+| `--recursive` | off | Whole child hierarchy; overrides `--depth` |
+| `--releases-top` | 5 | Recent releases inspected per pipeline |
+| `-v`, `--verbose` | off | Full PR list and per-release detail |
+
+Deployment lines only appear for the repos named by `AZDO_BACKEND_REPO`
+/ `AZDO_FRONTEND_REPO` and their `*_RELEASE_DEF` pipelines. PRs found in
+any other repo are still summarised, just without release data.
+
+(This command replaces the old `ado story-status`, which was
+story-only.)
+
 ## Features
 
 - Makefile for common tasks
