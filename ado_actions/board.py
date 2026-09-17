@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 import urllib.parse
 from html.parser import HTMLParser
 from pathlib import Path
@@ -15,11 +16,9 @@ from azure.devops.v7_1.work_item_tracking.models import Wiql
 from msrest.authentication import BasicAuthentication
 
 from ado_actions.fetch_test_plan import (
-    BACKEND_REPO,
     DEFAULT_ORG,
     DEFAULT_PROJECT,
     DEV_BRANCH,
-    FRONTEND_REPO,
     REPO_TO_RELEASE_DEF,
     _artifact_source_commit,
     _is_ancestor,
@@ -31,6 +30,52 @@ from ado_actions.fetch_test_plan import (
 
 DONE_STATES = {"Closed", "Resolved", "Done"}
 
+# Path segment that follows ``_sprints`` in a sprint URL and is a view name
+# rather than the team name.
+SPRINT_VIEWS = {"taskboard", "backlog", "capacity", "directory", "analytics"}
+
+
+def parse_sprint_url(url: str) -> dict[str, str] | None:
+    """Parse an ADO sprint URL into its org / project / team / iteration parts.
+
+    Handles e.g.::
+
+        https://dev.azure.com/<org>/<project>/_sprints/taskboard/<team>/<iteration path>
+        https://<org>.visualstudio.com/<project>/_sprints/backlog/<team>/<iteration path>
+
+    Segments are URL-decoded and the iteration path is rejoined with the
+    backslashes ADO expects. Any query string (taskboard filters such as
+    ``?System.State=...``) is ignored. Returns ``None`` when ``url`` is not a
+    recognizable sprint URL.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    segments = [urllib.parse.unquote(s) for s in parsed.path.split("/") if s]
+    if "_sprints" not in segments:
+        return None
+    idx = segments.index("_sprints")
+    before, after = segments[:idx], segments[idx + 1 :]
+    if not before:
+        return None
+    if parsed.netloc.lower().endswith("visualstudio.com"):
+        org = f"{parsed.scheme}://{parsed.netloc}"
+        project = before[-1]
+    else:
+        org = f"{parsed.scheme}://{parsed.netloc}/{before[0]}"
+        project = before[-1] if len(before) > 1 else before[0]
+    if after and after[0] in SPRINT_VIEWS:
+        after = after[1:]
+    out = {"org": org, "project": project}
+    if after:
+        out["team"] = after[0]
+    if len(after) > 1:
+        out["iteration"] = "\\".join(after[1:])
+    return out
+
 
 def resolve_iteration(work_client, project: str, team: str) -> Any | None:
     tc = TeamContext(project=project, team=team)
@@ -38,14 +83,48 @@ def resolve_iteration(work_client, project: str, team: str) -> Any | None:
     return iters[0] if iters else None
 
 
-def get_user_stories(wit_client, project: str, iteration_path: str) -> list[dict[str, Any]]:
+def team_area_clause(work_client, project: str, team: str) -> str | None:
+    """WIQL clause restricting results to a team's area paths.
+
+    An iteration path is project-wide: every team planning into the same sprint
+    shares it. What makes a sprint *a team's* sprint is the team's area paths,
+    which is what the taskboard filters on. Returns ``None`` when the team owns
+    the project root (no useful restriction) or when the lookup fails.
+    """
+    tc = TeamContext(project=project, team=team)
+    try:
+        tfv = work_client.get_team_field_values(tc)
+    except Exception as e:
+        print(f"WARN: cannot read team field values for '{team}': {e}", file=sys.stderr)
+        return None
+    field = getattr(getattr(tfv, "field", None), "reference_name", None) or "System.AreaPath"
+    clauses = []
+    for v in getattr(tfv, "values", None) or []:
+        value = (getattr(v, "value", "") or "").strip()
+        if not value or value == project:
+            # Team owns the project root; scoping would be a no-op.
+            return None
+        safe = value.replace("'", "''")
+        clauses.append(
+            f"[{field}] UNDER '{safe}'" if getattr(v, "include_children", False)
+            else f"[{field}] = '{safe}'"
+        )
+    if not clauses:
+        return None
+    return "(" + " OR ".join(clauses) + ")"
+
+
+def get_user_stories(
+    wit_client, project: str, iteration_path: str, area_clause: str | None = None
+) -> list[dict[str, Any]]:
     safe_path = iteration_path.replace("'", "''")
     query = (
         "SELECT [System.Id] FROM WorkItems "
         f"WHERE [System.TeamProject] = '{project}' "
         "AND [System.WorkItemType] = 'User Story' "
         f"AND [System.IterationPath] = '{safe_path}' "
-        "ORDER BY [System.Id]"
+        + (f"AND {area_clause} " if area_clause else "")
+        + "ORDER BY [System.Id]"
     )
     result = wit_client.query_by_wiql(Wiql(query=query))
     ids = [r.id for r in (result.work_items or [])]
@@ -71,132 +150,262 @@ def get_user_stories(wit_client, project: str, iteration_path: str) -> list[dict
     return out
 
 
-def fetch_pipeline_state(
-    release_client, git_client, project: str, repo_name: str, def_name: str, top: int
-) -> dict[str, Any] | None:
+PR_STATUS_CODE = {"active": "O", "completed": "M", "abandoned": "A"}
+# Rendering order for the status letters of a repo with several PRs.
+PR_STATUS_ORDER = "OMA"
+
+
+def repo_release_state(
+    build_client,
+    release_client,
+    repo: dict[str, Any],
+    releases_top: int,
+    cache: dict[str, Any],
+    out,
+) -> dict[str, Any]:
+    """Infer the release pipelines that ship ``repo`` and their deployed commits.
+
+    The chain is entirely derived from the repository -- nothing is configured:
+    repo -> build definitions consuming it -> release definitions consuming
+    those builds -> latest succeeded environment per release definition, with
+    the commit its artifact was built from.
+
+    Returns ``{"envs": {release_def_name: {env_name: commit_sha}}, "defs": n}``.
+    ``defs`` counts release definitions found even when none has a succeeded
+    deployment, so "no pipeline exists" stays distinguishable from "nothing
+    deployed yet". Cached per repo id, since a sprint hits the same handful of
+    repos over and over.
+    """
+    key = repo["id"]
+    if key in cache:
+        return cache[key]
+
+    state: dict[str, dict[str, str]] = {}
+    project = repo["project_name"]
     try:
-        defs = release_client.get_release_definitions(project=project, search_text=def_name)
-    except Exception as e:
-        print(f"  warn: cannot fetch release defs for {def_name}: {e}", file=sys.stderr)
-        return None
-    match = next((d for d in defs if d.name == def_name), None)
-    if not match:
-        return None
-    try:
-        releases = release_client.get_releases(
-            project=project,
-            definition_id=match.id,
-            top=top,
-            expand="environments,artifacts",
+        build_defs = list(
+            build_client.get_definitions(
+                project=project, repository_id=repo["id"], repository_type="TfsGit"
+            )
         )
     except Exception as e:
-        print(f"  warn: cannot fetch releases for {def_name}: {e}", file=sys.stderr)
-        return None
+        out(f"        {repo['name']}: cannot list build definitions ({e})")
+        build_defs = []
+    out(f"        {repo['name']}: {len(build_defs)} build def(s)")
 
-    env_latest: dict[str, dict[str, Any]] = {}
-    for rel in releases:
-        commits = [c for c in (_artifact_source_commit(a) for a in (rel.artifacts or [])) if c]
-        for env in (rel.environments or []):
-            if env.status == "succeeded" and env.name not in env_latest:
-                env_latest[env.name] = {
-                    "release_id": rel.id,
-                    "release_name": rel.name,
-                    "commit": commits[0] if commits else None,
-                }
+    release_defs: dict[int, str] = {}
+    for bd in build_defs:
+        try:
+            rds = release_client.get_release_definitions(
+                project=project,
+                artifact_type="Build",
+                artifact_source_id=f"{repo['project_id']}:{bd.id}",
+            )
+        except Exception as e:
+            out(f"        {repo['name']}: build {bd.id} release lookup failed ({e})")
+            continue
+        for rd in rds or []:
+            release_defs[rd.id] = rd.name
+    out(
+        f"        {repo['name']}: {len(release_defs)} release def(s)"
+        + (f" -> {', '.join(sorted(release_defs.values()))}" if release_defs else "")
+    )
 
-    repo_id: str | None = None
-    try:
-        repo = git_client.get_repository(repository_id=repo_name, project=project)
-        repo_id = getattr(repo, "id", None)
-    except Exception:
-        pass
+    for def_id, def_name in release_defs.items():
+        try:
+            releases = release_client.get_releases(
+                project=project,
+                definition_id=def_id,
+                top=releases_top,
+                expand="environments,artifacts",
+            )
+        except Exception as e:
+            out(f"        {def_name}: cannot fetch releases ({e})")
+            continue
+        env_latest: dict[str, str] = {}
+        for rel in releases or []:
+            commits = [
+                c for c in (_artifact_source_commit(a) for a in (rel.artifacts or [])) if c
+            ]
+            if not commits:
+                continue
+            for env in (rel.environments or []):
+                if env.status == "succeeded" and env.name not in env_latest:
+                    env_latest[env.name] = commits[0]
+        if env_latest:
+            state[def_name] = env_latest
+        out(
+            f"        {def_name}: "
+            + (", ".join(f"{e}={c[:8]}" for e, c in env_latest.items()) or "no succeeded envs")
+        )
 
-    return {"env_latest": env_latest, "repo_id": repo_id}
+    result = {"envs": state, "defs": len(release_defs)}
+    cache[key] = result
+    return result
 
 
-def envs_for_shas(
-    pipeline_state: dict[str, Any] | None,
+def deployed_envs(
     git_client,
-    project: str,
+    repo: dict[str, Any],
     merge_shas: list[str],
+    release_state: dict[str, Any],
+    ancestor_cache: dict[tuple[str, str, str], bool],
 ) -> list[str]:
-    if not pipeline_state or not merge_shas or not pipeline_state.get("repo_id"):
+    """Environments whose latest succeeded deploy contains one of ``merge_shas``."""
+    env_maps = (release_state or {}).get("envs") or {}
+    if not merge_shas or not env_maps:
         return []
     found: list[str] = []
-    for env_name, info in pipeline_state["env_latest"].items():
-        c = info.get("commit")
-        if not c:
-            continue
-        if any(_is_ancestor(git_client, project, pipeline_state["repo_id"], m, c) for m in merge_shas):
-            found.append(env_name)
+    for env_map in env_maps.values():
+        for env_name, deployed_commit in env_map.items():
+            if env_name in found:
+                continue
+            if any(
+                _ancestor_cached(
+                    git_client,
+                    repo["project_name"],
+                    ancestor_cache,
+                    repo["id"],
+                    sha,
+                    deployed_commit,
+                )
+                for sha in merge_shas
+            ):
+                found.append(env_name)
     return found
 
 
 def analyze_story(
-    wit_client, git_client, story_id: int, pipeline_states: dict[str, Any], project: str
-) -> dict[str, dict[str, Any]]:
-    pr_refs, _ = collect_descendant_pr_refs(wit_client, story_id)
-    by_repo: dict[str, dict[str, Any]] = {
-        BACKEND_REPO: {"merged_dev": False, "merged_release": False, "active": False, "merge_shas": []},
-        FRONTEND_REPO: {"merged_dev": False, "merged_release": False, "active": False, "merge_shas": []},
-    }
+    wit_client,
+    git_client,
+    build_client,
+    release_client,
+    story_id: int,
+    releases_top: int,
+    recursive: bool = False,
+    repo_cache: dict[str, Any] | None = None,
+    ancestor_cache: dict[tuple[str, str, str], bool] | None = None,
+    out=None,
+) -> dict[str, Any]:
+    """Resolve per-repo PR state and deployment state for one story.
+
+    Repos, and the pipelines that ship them, are discovered from the story's own
+    PR links -- nothing is pre-configured, so a story is reported against
+    whatever repos it actually touches.
+
+    With ``recursive`` the story's descendants (Tasks, Bugs, ...) are walked too
+    and their PRs fold up into the story's row; the story stays the unit of
+    reporting either way.
+    """
+    out = out or (lambda _msg: None)
+    repo_cache = repo_cache if repo_cache is not None else {}
+    ancestor_cache = ancestor_cache if ancestor_cache is not None else {}
+
+    pr_refs, visited = collect_descendant_pr_refs(
+        wit_client, story_id, max_depth=4 if recursive else 0
+    )
+    out(
+        f"      {len(pr_refs)} PR ref(s) from {len(visited)} work item(s)"
+        f"{' (recursive)' if recursive else ''}"
+    )
+
+    repos: dict[str, dict[str, Any]] = {}
     for project_id, _, pr_id in pr_refs:
         try:
             pr = git_client.get_pull_request_by_id(pull_request_id=pr_id, project=project_id)
-        except Exception:
+        except Exception as e:
+            out(f"      PR !{pr_id}: cannot fetch ({e})")
             continue
-        repo_name = getattr(getattr(pr, "repository", None), "name", "?") or "?"
-        if repo_name not in by_repo:
+        repository = getattr(pr, "repository", None)
+        repo_id = getattr(repository, "id", None)
+        repo_name = getattr(repository, "name", None)
+        if not repo_id or not repo_name:
+            out(f"      PR !{pr_id}: no repository on PR, skipped")
             continue
-        target = (pr.target_ref_name or "").replace("refs/heads/", "")
+        repo_project = getattr(repository, "project", None)
+        slot = repos.setdefault(
+            repo_id,
+            {
+                "id": repo_id,
+                "name": repo_name,
+                "project_id": getattr(repo_project, "id", None),
+                "project_name": getattr(repo_project, "name", None) or project_id,
+                "statuses": set(),
+                "merge_shas": [],
+            },
+        )
         status = pr.status
+        code = PR_STATUS_CODE.get(status)
+        if code:
+            slot["statuses"].add(code)
+        else:
+            out(f"      PR !{pr_id}: unmapped status {status!r}")
+        target = (pr.target_ref_name or "").replace("refs/heads/", "")
         merge_commit = getattr(pr, "last_merge_commit", None)
         merge_sha = getattr(merge_commit, "commit_id", None) if merge_commit else None
-        slot = by_repo[repo_name]
-        if status == "completed":
-            if target == DEV_BRANCH:
-                slot["merged_dev"] = True
-            elif target.startswith("release/"):
-                slot["merged_release"] = True
-            if merge_sha:
-                slot["merge_shas"].append(merge_sha)
-        elif status == "active":
-            slot["active"] = True
+        if status == "completed" and merge_sha:
+            slot["merge_shas"].append(merge_sha)
+        out(
+            f"      PR !{pr_id} {repo_name} -> {target or '?'} [{status}]"
+            f"{' merge=' + merge_sha[:8] if merge_sha else ''}"
+        )
 
-    out: dict[str, dict[str, Any]] = {}
-    for repo_name, label in [(BACKEND_REPO, "backend"), (FRONTEND_REPO, "frontend")]:
-        info = by_repo[repo_name]
-        flags = []
-        if info["merged_dev"]:
-            flags.append("dev")
-        if info["merged_release"]:
-            flags.append("rel")
-        if info["active"]:
-            flags.append("open-PR")
-        out[label] = {
-            "merge": "+".join(flags) if flags else "-",
-            "envs": envs_for_shas(pipeline_states.get(repo_name), git_client, project, info["merge_shas"]),
-            "has_prs": bool(pr_refs and any(p for p in by_repo[repo_name]["merge_shas"])) or info["active"],
-        }
-    return out
+    out_repos: list[dict[str, Any]] = []
+    for repo in repos.values():
+        release_state = repo_release_state(
+            build_client, release_client, repo, releases_top, repo_cache, out
+        )
+        envs = deployed_envs(git_client, repo, repo["merge_shas"], release_state, ancestor_cache)
+        out_repos.append({
+            "name": repo["name"],
+            "status": "".join(c for c in PR_STATUS_ORDER if c in repo["statuses"]),
+            "envs": envs,
+            "has_pipeline": bool(release_state.get("defs")),
+        })
+    out_repos.sort(key=lambda r: r["name"].lower())
+    return {"repos": out_repos}
 
 
 def truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def repos_cell(analysis: dict[str, Any]) -> str:
+    """``repo:STATUS`` per repo the story touches (O=open, M=merged, A=abandoned)."""
+    repos = analysis["repos"]
+    if not repos:
+        return "-"
+    return ", ".join(f"{r['name']}:{r['status'] or '?'}" for r in repos)
+
+
+def deploy_cell(analysis: dict[str, Any]) -> str:
+    """Environments the story's merged code reached.
+
+    Env names alone are ambiguous once a story spans repos -- "deployed to QAS"
+    says nothing about *which* repo got there -- so the repo is prefixed
+    whenever the story touches more than one, even if only one deployed.
+    """
+    repos = analysis["repos"]
+    deployed = [r for r in repos if r["envs"]]
+    if not deployed:
+        if repos and not any(r["has_pipeline"] for r in repos):
+            return "no-pipeline"
+        return "-"
+    if len(repos) == 1:
+        return ",".join(deployed[0]["envs"])
+    return ", ".join(f"{r['name']}:{','.join(r['envs'])}" for r in deployed)
+
+
 def print_table(rows: list[tuple[dict[str, Any], dict[str, Any]]], title_width: int) -> None:
-    headers = ["ID", "State", "Title", "BE Merge", "FE Merge", "BE Envs", "FE Envs"]
+    headers = ["ID", "State", "Title", "Repos / PRs", "Deployed"]
     body: list[list[str]] = []
     for s, a in rows:
         body.append([
             str(s["id"]),
             s["state"],
             truncate(s["title"], title_width),
-            a["backend"]["merge"],
-            a["frontend"]["merge"],
-            ",".join(a["backend"]["envs"]) or "-",
-            ",".join(a["frontend"]["envs"]) or "-",
+            repos_cell(a),
+            deploy_cell(a),
         ])
     cols = list(zip(*([headers] + body)))
     widths = [max(len(c) for c in col) for col in cols]
@@ -208,24 +417,52 @@ def print_table(rows: list[tuple[dict[str, Any], dict[str, Any]]], title_width: 
 
 
 def cmd_sprint(args: argparse.Namespace) -> int:
+    vprint = (lambda msg: print(msg)) if args.verbose else (lambda _msg: None)
+
+    org = args.org
+    project = args.project
+    team = args.team
+    iteration_path = args.iteration
+
+    if args.target:
+        from_url = parse_sprint_url(args.target)
+        if from_url:
+            org = from_url["org"]
+            project = from_url["project"]
+            team = from_url.get("team") or team
+            iteration_path = from_url.get("iteration") or iteration_path
+        elif args.target.lower().startswith(("http://", "https://")):
+            print(
+                f"ERROR: not a recognizable ADO sprint URL: {args.target}\n"
+                "Expected .../<org>/<project>/_sprints/<view>/<team>/<iteration path>.",
+                file=sys.stderr,
+            )
+            return 1
+        else:
+            iteration_path = args.target
+
+    vprint(f"Org:    {org}")
+    vprint(f"Project: {project}")
+    vprint(f"Mode:   {'recursive (story + descendants)' if args.recursive else 'story-linked PRs only'}")
+
     pat = get_pat()
-    conn = Connection(base_url=args.org, creds=BasicAuthentication("", pat))
+    conn = Connection(base_url=org, creds=BasicAuthentication("", pat))
     wit_client = conn.clients_v7_1.get_work_item_tracking_client()
     git_client = conn.clients_v7_1.get_git_client()
+    build_client = conn.clients_v7_1.get_build_client()
     release_client = conn.clients.get_release_client()
     work_client = conn.clients_v7_1.get_work_client()
 
-    if args.iteration:
-        iteration_path = args.iteration
-        iteration_name = args.iteration
+    if iteration_path:
+        iteration_name = iteration_path
     else:
-        team = args.team or args.project
+        team = team or project
         try:
-            it = resolve_iteration(work_client, args.project, team)
+            it = resolve_iteration(work_client, project, team)
         except Exception as e:
             print(
                 f"ERROR: cannot resolve current iteration for team '{team}': {e}\n"
-                "Pass --team <team-name> or --iteration <Project\\Path>.",
+                "Pass --team <team-name>, --iteration <Project\\Path>, or a sprint URL.",
                 file=sys.stderr,
             )
             return 1
@@ -235,27 +472,60 @@ def cmd_sprint(args: argparse.Namespace) -> int:
         iteration_path = it.path
         iteration_name = it.name
 
+    area_clause = None
+    if team and not args.all_teams:
+        area_clause = team_area_clause(work_client, project, team)
+        if area_clause is None:
+            vprint(f"Scope:  whole project (team '{team}' has no area-path restriction)")
+        else:
+            vprint(f"Scope:  {area_clause}")
+    elif args.all_teams:
+        vprint("Scope:  whole project (--all-teams)")
+    else:
+        vprint("Scope:  whole project (no team given)")
+
     print(f"Sprint: {iteration_name}")
     print(f"Path:   {iteration_path}")
+    if team:
+        print(f"Team:   {team}" + ("" if area_clause else " (no area-path scope \u2014 whole project)"))
     print()
 
-    stories = get_user_stories(wit_client, args.project, iteration_path)
+    stories = get_user_stories(wit_client, project, iteration_path, area_clause)
     if not stories:
-        print("No User Stories in this iteration.")
+        print("No User Stories in this iteration for the selected scope.")
         return 0
 
-    print(f"Pre-fetching pipeline state ({args.releases_top} releases per pipeline)...")
-    pipeline_states: dict[str, Any] = {}
-    for repo_name, (_, def_name) in REPO_TO_RELEASE_DEF.items():
-        pipeline_states[repo_name] = fetch_pipeline_state(
-            release_client, git_client, args.project, repo_name, def_name, args.releases_top
-        )
+    # Repos and their pipelines are discovered per story and memoised here, so
+    # each distinct repo costs one build-definition + release-definition lookup
+    # for the whole sprint rather than one per story.
+    repo_cache: dict[str, Any] = {}
+    ancestor_cache: dict[tuple[str, str, str], bool] = {}
 
-    print(f"Analyzing {len(stories)} story(ies)...\n")
+    total = len(stories)
+    print(f"Analyzing {total} story(ies)...\n")
     rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for s in stories:
-        analysis = analyze_story(wit_client, git_client, s["id"], pipeline_states, args.project)
+    started = time.monotonic()
+    for idx, s in enumerate(stories, 1):
+        t0 = time.monotonic()
+        vprint(f"[{idx}/{total}] #{s['id']} [{s['state']}] {truncate(s['title'], args.title_width)}")
+        analysis = analyze_story(
+            wit_client,
+            git_client,
+            build_client,
+            release_client,
+            s["id"],
+            args.releases_top,
+            recursive=args.recursive,
+            repo_cache=repo_cache,
+            ancestor_cache=ancestor_cache,
+            out=vprint,
+        )
+        vprint(
+            f"      -> {repos_cell(analysis)} | deployed: {deploy_cell(analysis)}"
+            f"  ({time.monotonic() - t0:.1f}s)"
+        )
         rows.append((s, analysis))
+    vprint(f"\nAnalyzed {total} story(ies) in {time.monotonic() - started:.1f}s\n")
 
     print_table(rows, args.title_width)
 
@@ -263,14 +533,23 @@ def cmd_sprint(args: argparse.Namespace) -> int:
     total = len(rows)
     remaining = total - done
     print()
-    print(f"Summary: {done} done · {remaining} remaining · {total} total")
-    print("Legend: BE/FE Merge — branches the story's PRs were merged into:")
-    print("          dev      = at least one PR completed → dev")
-    print("          rel      = at least one PR completed → release/* branch")
-    print("          open-PR  = a PR exists but is still active (not merged)")
-    print("          -        = no PR linked for this repo")
-    print("        BE/FE Envs — environments whose latest succeeded release")
-    print("          contains a story PR's merge commit (ancestry-checked).")
+    print(f"Summary: {done} done \u00b7 {remaining} remaining \u00b7 {total} total")
+
+    all_repos = sorted({r["name"] for _, a in rows for r in a["repos"]})
+    all_envs = sorted({e for _, a in rows for r in a["repos"] for e in r["envs"]})
+    print(f"Repos found in sprint ({len(all_repos)}): {', '.join(all_repos) or 'none'}")
+    print(f"Envs found in sprint ({len(all_envs)}): {', '.join(all_envs) or 'none'}")
+    print()
+    print("Legend: Repos / PRs \u2014 one <repo>:<status> per repo the story touches,")
+    print("          O = open PR, M = merged (completed), A = abandoned;")
+    print("          letters combine when a repo has PRs in several states (e.g. OM).")
+    print("        Deployed \u2014 environments whose latest succeeded release was built")
+    print("          from a commit containing the story's merge commit (ancestry-checked).")
+    print("          Prefixed <repo>:<env> whenever the story touches several repos.")
+    print("          'no-pipeline' = the story's repos have no release definition, so")
+    print("          deployment state is unknown rather than negative.")
+    print("        Repos and pipelines are inferred from each story's linked PRs;")
+    print("        nothing is configured. Use --recursive to fold child work items in.")
     return 0
 
 
@@ -1112,6 +1391,41 @@ def main() -> int:
         "--iteration",
         default=None,
         help="Explicit iteration path (e.g. 'example-project\\\\PI 2 Sprint 7'). Skips current-iteration lookup.",
+    )
+    sp.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help=(
+            "Sprint URL (e.g. https://dev.azure.com/<org>/<project>/_sprints/taskboard/"
+            "<team>/<iteration path>; query-string filters are ignored) or a bare "
+            "iteration path. Org/project/team/iteration parsed from a URL override the "
+            "corresponding flags."
+        ),
+    )
+    sp.add_argument(
+        "--all-teams",
+        action="store_true",
+        help=(
+            "Do not restrict to the team's area paths. An iteration is shared by every "
+            "team planning into it, so this reports the whole project's stories for the "
+            "sprint rather than the team's taskboard."
+        ),
+    )
+    sp.add_argument(
+        "--recursive",
+        action="store_true",
+        help=(
+            "Walk each story's child work items (Tasks, Bugs, ...) when collecting PRs "
+            "for the BE/FE merge and env columns. Most PRs hang off children, but this "
+            "costs several extra API calls per story."
+        ),
+    )
+    sp.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print per-story progress: PRs found, target branches, resolved envs, timings.",
     )
     sp.add_argument(
         "--releases-top",
