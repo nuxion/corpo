@@ -70,21 +70,16 @@ docs-serve:
 SHIV_PYTHON ?= /usr/bin/env python3
 SHIV_OUT ?= dist
 
-.PHONY: zipapps board-zipapp pipeline-zipapp
-zipapps: board-zipapp pipeline-zipapp
+.PHONY: zipapps ado-zipapp
+zipapps: ado-zipapp
 
-board-zipapp:
+ado-zipapp:
 	mkdir -p $(SHIV_OUT)
-	uv run shiv -c board -o $(SHIV_OUT)/board -p "$(SHIV_PYTHON)" --compressed .
-
-pipeline-zipapp:
-	mkdir -p $(SHIV_OUT)
-	uv run shiv -c pipeline -o $(SHIV_OUT)/pipeline -p "$(SHIV_PYTHON)" --compressed .
+	uv run shiv -c ado -o $(SHIV_OUT)/ado -p "$(SHIV_PYTHON)" --compressed .
 
 install-zipapps: zipapps
 	mkdir -p $(HOME)/.local/bin
-	install -m 0755 $(SHIV_OUT)/board $(HOME)/.local/bin/board
-	install -m 0755 $(SHIV_OUT)/pipeline $(HOME)/.local/bin/pipeline
+	install -m 0755 $(SHIV_OUT)/ado $(HOME)/.local/bin/ado
 
 ## Standard commands for CI/CD cycle
 

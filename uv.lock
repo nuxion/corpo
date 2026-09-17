@@ -8,6 +8,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "azure-devops" },
+    { name = "click" },
 ]
 
 [package.dev-dependencies]
@@ -19,7 +20,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "azure-devops", specifier = ">=7.1.0b4" }]
+requires-dist = [
+    { name = "azure-devops", specifier = ">=7.1.0b4" },
+    { name = "click", specifier = ">=8.1" },
+]
 
 [package.metadata.requires-dev]
 dev = [

@@ -1,7 +1,6 @@
 """Repository helpers: PR review with worktree + AI agent."""
 from __future__ import annotations
 
-import argparse
 import re
 import shutil
 import subprocess
@@ -10,9 +9,11 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+import click
 from azure.devops.connection import Connection
 from msrest.authentication import BasicAuthentication
 
+from ado_actions.cliargs import Args
 from ado_actions.fetch_test_plan import DEFAULT_ORG, DEFAULT_PROJECT, get_pat
 
 
@@ -64,7 +65,7 @@ def ensure_worktree(repo_path: Path, branch: str, dest: Path) -> None:
 
 
 def fetch_work_items(ids: list[int], out_dir: Path, org: str, project: str) -> list[Path]:
-    """Invoke `board fetch-work` for each id; return written paths."""
+    """Invoke `ado board fetch-work` for each id; return written paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for wid in ids:
@@ -72,13 +73,13 @@ def fetch_work_items(ids: list[int], out_dir: Path, org: str, project: str) -> l
         try:
             r = _run(
                 [
-                    "board", "fetch-work", str(wid),
+                    "ado", "board", "fetch-work", str(wid),
                     "--org", org, "--project", project,
                     "--out-dir", str(out_dir),
                 ]
             )
         except subprocess.CalledProcessError as e:
-            print(f"  warn: board fetch-work {wid} failed: {e.stderr}", file=sys.stderr)
+            print(f"  warn: ado board fetch-work {wid} failed: {e.stderr}", file=sys.stderr)
             continue
         m = re.search(r"Wrote (.+)$", r.stdout.strip())
         if m:
@@ -147,7 +148,7 @@ def run_agent(agent: str, prompt: str, cwd: Path) -> str:
     return "".join(chunks)
 
 
-def cmd_review(args: argparse.Namespace) -> int:
+def cmd_review(args: Args) -> int:
     if args.url:
         try:
             org_url, project, repo, pr_id = parse_pr_ref(args.url)
@@ -226,46 +227,41 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="repo")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    rv = sub.add_parser("review", help="Review an ADO pull request via claude/copilot.")
-    rv.add_argument(
-        "url",
-        nargs="?",
-        help="Full PR URL, e.g. https://dev.azure.com/<org>/<proj>/_git/<repo>/pullrequest/<id>.",
-    )
-    rv.add_argument("--repo", default=None, help="Repository name (when url not supplied).")
-    rv.add_argument("--pr", default=None, help="Pull request ID (when url not supplied).")
-    rv.add_argument("--org", default=None, help=f"Org URL (default: {DEFAULT_ORG}).")
-    rv.add_argument("--project", default=None, help=f"Project (default: {DEFAULT_PROJECT}).")
-    rv.add_argument(
-        "--repo-path",
-        default=None,
-        help="Local path to the cloned repo to create the worktree from (default: cwd).",
-    )
-    rv.add_argument(
-        "--worktree-dir",
-        default=".worktrees",
-        help="Directory under which the PR worktree is created (default: ./.worktrees).",
-    )
-    agent_group = rv.add_mutually_exclusive_group()
-    agent_group.add_argument(
-        "--claude", dest="agent", action="store_const", const="claude",
-        help="Use the `claude` CLI (default).",
-    )
-    agent_group.add_argument(
-        "--copilot", dest="agent", action="store_const", const="copilot",
-        help="Use the `copilot` CLI.",
-    )
-    rv.set_defaults(agent="claude")
-    rv.add_argument("--out", default=None, help="Optional file to write the review output.")
-    rv.set_defaults(func=cmd_review)
-
-    args = p.parse_args()
-    return args.func(args)
+@click.group("repo")
+def repo_cli() -> None:
+    """Repository and pull request helpers."""
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+@repo_cli.command("review")
+@click.argument("url", required=False, default=None)
+@click.option("--repo", default=None, help="Repository name (when url not supplied).")
+@click.option("--pr", default=None, help="Pull request ID (when url not supplied).")
+@click.option("--org", default=None, help=f"Org URL (default: {DEFAULT_ORG}).")
+@click.option("--project", default=None, help=f"Project (default: {DEFAULT_PROJECT}).")
+@click.option(
+    "--repo-path",
+    default=None,
+    help="Local path to the cloned repo to create the worktree from (default: cwd).",
+)
+@click.option(
+    "--worktree-dir",
+    default=".worktrees",
+    show_default=True,
+    help="Directory under which the PR worktree is created.",
+)
+@click.option(
+    "--claude",
+    "agent",
+    flag_value="claude",
+    default=True,
+    help="Use the `claude` CLI (default).",
+)
+@click.option("--copilot", "agent", flag_value="copilot", help="Use the `copilot` CLI.")
+@click.option("--out", default=None, help="Optional file to write the review output.")
+def cli_review(**kwargs: Any) -> None:
+    """Review an ADO pull request via claude/copilot.
+
+    URL is the full PR URL, e.g.
+    https://dev.azure.com/<org>/<proj>/_git/<repo>/pullrequest/<id>.
+    """
+    raise SystemExit(cmd_review(Args(**kwargs)))

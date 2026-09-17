@@ -62,14 +62,24 @@ The package installs an `ado` console script (see
 `[project.scripts]` in `pyproject.toml`). Run it with `uv run ado` or,
 after `uv sync`, directly as `ado`.
 
-The CLI has three subcommands: `fetch`, `show-plan`, and `show-story`.
+`ado` groups its commands by area:
+
+| Group | Commands | What it covers |
+|-------|----------|----------------|
+| `ado testing` | `fetch`, `show-plan`, `show-story` | Test plans, suites and test cases |
+| `ado board` | `sprint`, `fetch-work`, `work-status` | Sprints and work items |
+| `ado pipeline` | `build`, `release`, `deploy`, `watch` | Builds, releases and deployments |
+| `ado repo` | `review` | Pull request review via an AI agent |
+
+Every level has `--help`, e.g. `ado testing --help` or
+`ado board work-status --help`.
 
 ### Fetch a whole plan
 
 Basic — flat output, one markdown per test case:
 
 ```fish
-uv run ado fetch --plan-id 1001
+uv run ado testing fetch --plan-id 1001
 ```
 
 Group cases by their parent User Story (uses the `TestedBy` work item
@@ -77,7 +87,7 @@ relation), write a `story-index.md`, and pull the User Story
 definition into each story folder:
 
 ```fish
-uv run ado fetch \
+uv run ado testing fetch \
   --plan-id 1001 \
   --md-dir tests2/plan-1001 \
   --group-by-story \
@@ -116,13 +126,13 @@ useful for finding a `--folder-id` to scope a later run, or just
 auditing how a plan is organised:
 
 ```fish
-uv run ado show-plan --plan-id 1001
+uv run ado testing show-plan --plan-id 1001
 ```
 
 Limit the tree to one subtree:
 
 ```fish
-uv run ado show-plan --plan-id 1001 --folder-id 2004
+uv run ado testing show-plan --plan-id 1001 --folder-id 2004
 ```
 
 Each line is prefixed with `[F]` for folder/static suites and `[S]`
@@ -134,7 +144,7 @@ After running `fetch`, query the resulting JSON for one story without
 hitting the API again:
 
 ```fish
-uv run ado show-story 11336 \
+uv run ado testing show-story 11336 \
   --json test_cases_plan_1001.json
 ```
 
@@ -149,7 +159,7 @@ Story 11336: Export Requests to Excel (model+support)
 ```
 
 
-### Work item status (`board work-status`)
+### Work item status (`ado board work-status`)
 
 Merge & deployment state for **any** work item — Task, Bug, User Story,
 Feature or Epic. It walks the item's whole subtree for linked Pull
@@ -161,17 +171,17 @@ Takes an id or a full work-item URL (org and project are inferred from
 the URL):
 
 ```fish
-uv run board work-status 7638343
-uv run board work-status https://dev.azure.com/<org>/<project>/_workitems/edit/7638343
+uv run ado board work-status 7638343
+uv run ado board work-status https://dev.azure.com/<org>/<project>/_workitems/edit/7638343
 ```
 
 Report on the hierarchy below the item as well — same flags as
-`board fetch-work`:
+`ado board fetch-work`:
 
 ```fish
-uv run board work-status 7291258 --children      # each direct child too
-uv run board work-status 7291258 --depth 2       # children and grandchildren
-uv run board work-status 7291258 --recursive     # the whole tree
+uv run ado board work-status 7291258 --children      # each direct child too
+uv run ado board work-status 7291258 --depth 2       # children and grandchildren
+uv run ado board work-status 7291258 --recursive     # the whole tree
 ```
 
 | Flag | Default | Notes |

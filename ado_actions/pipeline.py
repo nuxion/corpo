@@ -1,7 +1,6 @@
 """Pipeline operations: queue builds, create releases, deploy environments."""
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -10,6 +9,7 @@ import time
 import urllib.parse
 from typing import Any
 
+import click
 from azure.devops.connection import Connection
 from azure.devops.v7_1.build.models import AgentPoolQueue, Build, DefinitionReference
 from azure.devops.v7_1.release.models import (
@@ -21,6 +21,7 @@ from azure.devops.v7_1.release.models import (
 )
 from msrest.authentication import BasicAuthentication
 
+from ado_actions.cliargs import Args
 from ado_actions.fetch_test_plan import DEFAULT_ORG, DEFAULT_PROJECT, get_pat
 
 
@@ -54,7 +55,7 @@ def parse_org_project_url(url: str) -> tuple[str, str | None]:
     return org_url, project
 
 
-def resolve_context(args: argparse.Namespace) -> tuple[str, str]:
+def resolve_context(args: Args) -> tuple[str, str]:
     """Resolve (org_url, project) from --org/--project, --url, env, then defaults."""
     url_org: str | None = None
     url_project: str | None = None
@@ -205,7 +206,7 @@ def await_build_number(build_client, project: str, build_id: int, timeout: int =
     return build
 
 
-def cmd_build(args: argparse.Namespace) -> int:
+def cmd_build(args: Args) -> int:
     org_url, project = resolve_context(args)
     if not args.branch and not args.list_vars:
         print("ERROR: --branch is required", file=sys.stderr)
@@ -473,7 +474,7 @@ def release_web_url(release: Any, org_url: str, project: str) -> str:
     return f"{org_url}/{urllib.parse.quote(project)}/_release?releaseId={release.id}&_a=release-summary"
 
 
-def cmd_release(args: argparse.Namespace) -> int:
+def cmd_release(args: Args) -> int:
     org_url, project = resolve_context(args)
     try:
         variables = parse_variables(args.var)
@@ -624,7 +625,7 @@ def watch_deployment(
         time.sleep(poll)
 
 
-def cmd_deploy(args: argparse.Namespace) -> int:
+def cmd_deploy(args: Args) -> int:
     org_url, project = resolve_context(args)
     if not args.pipeline and not args.release:
         print("ERROR: provide a release pipeline name or --release <id>.", file=sys.stderr)
@@ -760,7 +761,7 @@ def pick_active_environment(release: Any) -> Any:
     )
 
 
-def cmd_watch(args: argparse.Namespace) -> int:
+def cmd_watch(args: Args) -> int:
     try:
         target = parse_watch_target(args.target)
     except ValueError as e:
@@ -839,140 +840,143 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0 if finished.status == "succeeded" else 1
 
 
-def add_context_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+def context_options(func):
+    """Attach the shared --url / --org / --project options to a command."""
+    func = click.option(
+        "--project", default=None, help=f"Project (default: {DEFAULT_PROJECT})."
+    )(func)
+    func = click.option("--org", default=None, help=f"Org URL (default: {DEFAULT_ORG}).")(func)
+    func = click.option(
         "--url",
         default=None,
         help="ADO URL to infer org/project, e.g. https://dev.azure.com/{org}/{project}/",
-    )
-    parser.add_argument("--org", default=None, help=f"Org URL (default: {DEFAULT_ORG}).")
-    parser.add_argument("--project", default=None, help=f"Project (default: {DEFAULT_PROJECT}).")
+    )(func)
+    return func
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="pipeline")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    b = sub.add_parser("build", help="Queue a build pipeline on a branch.")
-    b.add_argument("pipeline", help="Build pipeline name, e.g. Nexus-FrontEnd-CI.")
-    b.add_argument(
-        "--branch",
-        default=None,
-        help="Branch to build, e.g. dev or release/1.2. Required unless --list-vars.",
-    )
-    b.add_argument("--pool", default=None, help="Agent pool/queue name to override the default.")
-    b.add_argument(
+def var_option(help_text: str):
+    """A repeatable KEY=VALUE variable override option."""
+    return click.option(
         "--var",
-        action="append",
-        default=None,
+        "var",
+        multiple=True,
         metavar="KEY=VALUE",
-        help="Queue-time variable override, e.g. --var RunSonarQubeStep=true; repeatable.",
+        help=help_text,
     )
-    b.add_argument(
-        "--list-vars",
-        action="store_true",
-        help="List the pipeline's variables and whether they are settable, then exit.",
-    )
-    b.add_argument("--watch", action="store_true", help="Follow the build until it completes.")
-    b.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the result as JSON (waits for the build number to be assigned).",
-    )
-    b.add_argument(
+
+
+def poll_option(help_text: str):
+    return click.option(
         "--poll",
         type=int,
         default=POLL_SECONDS,
-        help=f"Seconds between polls when watching (default: {POLL_SECONDS}).",
+        show_default=True,
+        help=help_text,
     )
-    add_context_args(b)
-    b.set_defaults(func=cmd_build)
-
-    r = sub.add_parser("release", help="Create a release from a release pipeline.")
-    r.add_argument("pipeline", help="Release pipeline name, e.g. EXAMPLE-API-CD.")
-    r.add_argument(
-        "--version",
-        default=None,
-        help="Artifact build number to release (default: newest successful build).",
-    )
-    r.add_argument(
-        "--branch",
-        default=None,
-        help="Only consider artifact builds from this branch when picking the version.",
-    )
-    r.add_argument("--description", default=None, help="Release description.")
-    r.add_argument(
-        "--var",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help="Release variable override; repeatable.",
-    )
-    r.add_argument(
-        "--manual",
-        action="store_true",
-        help="Hold every stage for manual deployment (use `pipeline deploy` after).",
-    )
-    r.add_argument("--draft", action="store_true", help="Create the release as a draft.")
-    r.add_argument("--json", action="store_true", help="Emit the result as JSON.")
-    add_context_args(r)
-    r.set_defaults(func=cmd_release)
-
-    d = sub.add_parser("deploy", help="Deploy a release to an environment.")
-    d.add_argument(
-        "pipeline",
-        nargs="?",
-        default=None,
-        help="Release pipeline name; its latest release is used unless --release is given.",
-    )
-    d.add_argument("--env", required=True, help="Environment/stage name, e.g. DEV or QA.")
-    d.add_argument("--release", default=None, help="Release id to deploy (default: latest).")
-    d.add_argument("--comment", default=None, help="Deployment comment.")
-    d.add_argument(
-        "--var",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help="Stage variable override; repeatable.",
-    )
-    d.add_argument("--watch", action="store_true", help="Follow the deployment until it finishes.")
-    d.add_argument(
-        "--poll",
-        type=int,
-        default=POLL_SECONDS,
-        help=f"Seconds between polls when watching (default: {POLL_SECONDS}).",
-    )
-    add_context_args(d)
-    d.set_defaults(func=cmd_deploy)
-
-    w = sub.add_parser("watch", help="Follow a running build or deployment by id or URL.")
-    w.add_argument(
-        "target",
-        help="Build/release id, or an ADO URL containing buildId= or releaseId=.",
-    )
-    w.add_argument(
-        "--kind",
-        choices=["build", "release"],
-        default=None,
-        help="Disambiguate a bare id (default: build, or release when --env is given).",
-    )
-    w.add_argument(
-        "--env",
-        default=None,
-        help="Stage to follow on a release (default: the running or most recent one).",
-    )
-    w.add_argument(
-        "--poll",
-        type=int,
-        default=POLL_SECONDS,
-        help=f"Seconds between polls (default: {POLL_SECONDS}).",
-    )
-    add_context_args(w)
-    w.set_defaults(func=cmd_watch)
-
-    args = p.parse_args()
-    return args.func(args)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+@click.group("pipeline")
+def pipeline_cli() -> None:
+    """Builds, releases and deployments."""
+
+
+@pipeline_cli.command("build")
+@click.argument("pipeline")
+@click.option(
+    "--branch",
+    default=None,
+    help="Branch to build, e.g. dev or release/1.2. Required unless --list-vars.",
+)
+@click.option("--pool", default=None, help="Agent pool/queue name to override the default.")
+@var_option("Queue-time variable override, e.g. --var RunSonarQubeStep=true; repeatable.")
+@click.option(
+    "--list-vars",
+    is_flag=True,
+    help="List the pipeline's variables and whether they are settable, then exit.",
+)
+@click.option("--watch", is_flag=True, help="Follow the build until it completes.")
+@click.option(
+    "--json",
+    "json",
+    is_flag=True,
+    help="Emit the result as JSON (waits for the build number to be assigned).",
+)
+@poll_option("Seconds between polls when watching.")
+@context_options
+def cli_build(**kwargs: Any) -> None:
+    """Queue a build pipeline on a branch.
+
+    PIPELINE is the build pipeline name, e.g. Nexus-FrontEnd-CI.
+    """
+    raise SystemExit(cmd_build(Args(**kwargs)))
+
+
+@pipeline_cli.command("release")
+@click.argument("pipeline")
+@click.option(
+    "--version",
+    default=None,
+    help="Artifact build number to release (default: newest successful build).",
+)
+@click.option(
+    "--branch",
+    default=None,
+    help="Only consider artifact builds from this branch when picking the version.",
+)
+@click.option("--description", default=None, help="Release description.")
+@var_option("Release variable override; repeatable.")
+@click.option(
+    "--manual",
+    is_flag=True,
+    help="Hold every stage for manual deployment (use `ado pipeline deploy` after).",
+)
+@click.option("--draft", is_flag=True, help="Create the release as a draft.")
+@click.option("--json", "json", is_flag=True, help="Emit the result as JSON.")
+@context_options
+def cli_release(**kwargs: Any) -> None:
+    """Create a release from a release pipeline.
+
+    PIPELINE is the release pipeline name, e.g. EXAMPLE-API-CD.
+    """
+    raise SystemExit(cmd_release(Args(**kwargs)))
+
+
+@pipeline_cli.command("deploy")
+@click.argument("pipeline", required=False, default=None)
+@click.option("--env", required=True, help="Environment/stage name, e.g. DEV or QA.")
+@click.option("--release", default=None, help="Release id to deploy (default: latest).")
+@click.option("--comment", default=None, help="Deployment comment.")
+@var_option("Stage variable override; repeatable.")
+@click.option("--watch", is_flag=True, help="Follow the deployment until it finishes.")
+@poll_option("Seconds between polls when watching.")
+@context_options
+def cli_deploy(**kwargs: Any) -> None:
+    """Deploy a release to an environment.
+
+    PIPELINE is a release pipeline name; its latest release is used unless
+    --release is given.
+    """
+    raise SystemExit(cmd_deploy(Args(**kwargs)))
+
+
+@pipeline_cli.command("watch")
+@click.argument("target")
+@click.option(
+    "--kind",
+    type=click.Choice(["build", "release"]),
+    default=None,
+    help="Disambiguate a bare id (default: build, or release when --env is given).",
+)
+@click.option(
+    "--env",
+    default=None,
+    help="Stage to follow on a release (default: the running or most recent one).",
+)
+@poll_option("Seconds between polls.")
+@context_options
+def cli_watch(**kwargs: Any) -> None:
+    """Follow a running build or deployment by id or URL.
+
+    TARGET is a build/release id, or an ADO URL containing buildId= or releaseId=.
+    """
+    raise SystemExit(cmd_watch(Args(**kwargs)))

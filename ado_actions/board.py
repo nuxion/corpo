@@ -1,7 +1,6 @@
 """Sprint board: per-story merge & deployment state for a given iteration."""
 from __future__ import annotations
 
-import argparse
 import re
 import sys
 import time
@@ -10,11 +9,13 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+import click
 from azure.devops.connection import Connection
 from azure.devops.v7_1.work.models import TeamContext
 from azure.devops.v7_1.work_item_tracking.models import Wiql
 from msrest.authentication import BasicAuthentication
 
+from ado_actions.cliargs import Args
 from ado_actions.fetch_test_plan import (
     DEFAULT_ORG,
     DEFAULT_PROJECT,
@@ -416,7 +417,7 @@ def print_table(rows: list[tuple[dict[str, Any], dict[str, Any]]], title_width: 
         print(fmt.format(*r))
 
 
-def cmd_sprint(args: argparse.Namespace) -> int:
+def cmd_sprint(args: Args) -> int:
     vprint = (lambda msg: print(msg)) if args.verbose else (lambda _msg: None)
 
     org = args.org
@@ -875,7 +876,7 @@ def collect_descendants(
     return out
 
 
-def resolve_depth(args: argparse.Namespace) -> int:
+def resolve_depth(args: Args) -> int:
     """How many hierarchy levels the --children/--depth/--recursive flags ask for.
 
     --recursive wins over --depth, which wins over --children (a shorthand for
@@ -890,7 +891,7 @@ def resolve_depth(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fetch_work(args: argparse.Namespace) -> int:
+def cmd_fetch_work(args: Args) -> int:
     try:
         wid, url_org, url_project = parse_work_item_ref(args.ref)
     except ValueError as e:
@@ -1325,7 +1326,7 @@ def report_work_item_status(
     print()
 
 
-def cmd_work_status(args: argparse.Namespace) -> int:
+def cmd_work_status(args: Args) -> int:
     try:
         wid, url_org, url_project = parse_work_item_ref(args.ref)
     except ValueError as e:
@@ -1375,191 +1376,186 @@ def cmd_work_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="board")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    sp = sub.add_parser("sprint", help="Show merge & deployment status for stories in a sprint.")
-    sp.add_argument("--project", default=DEFAULT_PROJECT)
-    sp.add_argument("--org", default=DEFAULT_ORG)
-    sp.add_argument(
-        "--team",
-        default=None,
-        help="Team name (defaults to project name). Used to resolve the current iteration.",
-    )
-    sp.add_argument(
-        "--iteration",
-        default=None,
-        help="Explicit iteration path (e.g. 'example-project\\\\PI 2 Sprint 7'). Skips current-iteration lookup.",
-    )
-    sp.add_argument(
-        "target",
-        nargs="?",
-        default=None,
-        help=(
-            "Sprint URL (e.g. https://dev.azure.com/<org>/<project>/_sprints/taskboard/"
-            "<team>/<iteration path>; query-string filters are ignored) or a bare "
-            "iteration path. Org/project/team/iteration parsed from a URL override the "
-            "corresponding flags."
-        ),
-    )
-    sp.add_argument(
-        "--all-teams",
-        action="store_true",
-        help=(
-            "Do not restrict to the team's area paths. An iteration is shared by every "
-            "team planning into it, so this reports the whole project's stories for the "
-            "sprint rather than the team's taskboard."
-        ),
-    )
-    sp.add_argument(
-        "--recursive",
-        action="store_true",
-        help=(
-            "Walk each story's child work items (Tasks, Bugs, ...) when collecting PRs "
-            "for the BE/FE merge and env columns. Most PRs hang off children, but this "
-            "costs several extra API calls per story."
-        ),
-    )
-    sp.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print per-story progress: PRs found, target branches, resolved envs, timings.",
-    )
-    sp.add_argument(
-        "--releases-top",
-        type=int,
-        default=10,
-        help="Recent releases to inspect per pipeline (default: 10).",
-    )
-    sp.add_argument(
-        "--title-width",
-        type=int,
-        default=50,
-        help="Truncate story title to this many chars (default: 50).",
-    )
-    sp.set_defaults(func=cmd_sprint)
-
-    fw = sub.add_parser(
-        "fetch-work",
-        help="Download a single work item as Markdown.",
-    )
-    fw.add_argument(
-        "ref",
-        help="Work item ID (e.g. 7102940) or full URL "
-        "(e.g. https://dev.azure.com/<org>/<project>/_workitems/edit/7102940/).",
-    )
-    fw.add_argument(
-        "--org",
-        default=None,
-        help=f"Override organization URL (default: parsed from URL or {DEFAULT_ORG}).",
-    )
-    fw.add_argument(
-        "--project",
-        default=None,
-        help=f"Override project (default: parsed from URL or {DEFAULT_PROJECT}).",
-    )
-    fw.add_argument(
-        "--out-dir",
-        default="reports",
-        help="Output directory for the markdown file (default: reports).",
-    )
-    fw.add_argument(
-        "--out",
-        default=None,
-        help="Explicit output file path (overrides --out-dir naming).",
-    )
-    fw.add_argument(
-        "--stdout",
-        action="store_true",
-        help="Write the markdown to stdout instead of a file.",
-    )
-    fw.add_argument(
-        "--children",
-        "--include-child",
-        dest="children",
-        action="store_true",
-        help="Also render the direct children (first level only), e.g. a "
-        "Feature's child User Stories. Shorthand for --depth 1.",
-    )
-    fw.add_argument(
-        "--depth",
-        type=int,
-        default=None,
-        help="How many hierarchy levels to descend and render. "
-        "1 = direct children, 2 = also grandchildren (e.g. an Epic's Features "
-        "AND their User Stories), etc. Overrides --include-child.",
-    )
-    fw.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Descend the entire child hierarchy (Epic -> Feature -> User Story "
-        "-> Task ...). Overrides --depth / --include-child.",
-    )
-    fw.add_argument(
-        "--split",
-        action="store_true",
-        help="Write one file per work item into --out-dir (e.g. EPIC-*.md, "
-        "FEATURE-*.md, US-*.md) instead of a single combined document. "
-        "Cannot be used with --stdout or --out.",
-    )
-    fw.set_defaults(func=cmd_fetch_work)
-
-    ws = sub.add_parser(
-        "work-status",
-        help="Show merge & deployment status for any work item (Task, Story, Feature, Epic…).",
-    )
-    ws.add_argument(
-        "ref",
-        help="Work item ID (e.g. 7102940) or full URL "
-        "(e.g. https://dev.azure.com/<org>/<project>/_workitems/edit/7102940).",
-    )
-    ws.add_argument(
-        "--org",
-        default=None,
-        help=f"Override organization URL (default: parsed from URL or {DEFAULT_ORG}).",
-    )
-    ws.add_argument(
-        "--project",
-        default=None,
-        help=f"Override project (default: parsed from URL or {DEFAULT_PROJECT}).",
-    )
-    ws.add_argument(
-        "--children",
-        "--include-child",
-        dest="children",
-        action="store_true",
-        help="Also report each direct child separately. Shorthand for --depth 1.",
-    )
-    ws.add_argument(
-        "--depth",
-        type=int,
-        default=None,
-        help="How many hierarchy levels to report on individually "
-        "(1 = direct children, 2 = also grandchildren). Overrides --children.",
-    )
-    ws.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Report on the entire child hierarchy. Overrides --depth / --children.",
-    )
-    ws.add_argument(
-        "--releases-top",
-        type=int,
-        default=5,
-        help="How many recent releases to inspect per pipeline (default: 5).",
-    )
-    ws.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Show the full PR list and per-release detail. Default is a summary per repo.",
-    )
-    ws.set_defaults(func=cmd_work_status)
-
-    args = p.parse_args()
-    return args.func(args)
+@click.group("board")
+def board_cli() -> None:
+    """Sprints and work items."""
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+@board_cli.command("sprint")
+@click.argument("target", required=False, default=None)
+@click.option("--project", default=DEFAULT_PROJECT, show_default=True)
+@click.option("--org", default=DEFAULT_ORG, show_default=True)
+@click.option(
+    "--team",
+    default=None,
+    help="Team name (defaults to project name). Used to resolve the current iteration.",
+)
+@click.option(
+    "--iteration",
+    default=None,
+    help="Explicit iteration path (e.g. 'example-project\\\\PI 2 Sprint 7'). "
+    "Skips current-iteration lookup.",
+)
+@click.option(
+    "--all-teams",
+    is_flag=True,
+    help="Do not restrict to the team's area paths. An iteration is shared by every "
+    "team planning into it, so this reports the whole project's stories for the "
+    "sprint rather than the team's taskboard.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    help="Walk each story's child work items (Tasks, Bugs, ...) when collecting PRs "
+    "for the BE/FE merge and env columns. Most PRs hang off children, but this "
+    "costs several extra API calls per story.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print per-story progress: PRs found, target branches, resolved envs, timings.",
+)
+@click.option(
+    "--releases-top",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Recent releases to inspect per pipeline.",
+)
+@click.option(
+    "--title-width",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Truncate story title to this many chars.",
+)
+def cli_sprint(**kwargs: Any) -> None:
+    """Show merge & deployment status for stories in a sprint.
+
+    TARGET is a sprint URL (e.g. https://dev.azure.com/<org>/<project>/_sprints/
+    taskboard/<team>/<iteration path>; query-string filters are ignored) or a bare
+    iteration path. Org/project/team/iteration parsed from a URL override the
+    corresponding flags.
+    """
+    raise SystemExit(cmd_sprint(Args(**kwargs)))
+
+
+@board_cli.command("fetch-work")
+@click.argument("ref")
+@click.option(
+    "--org",
+    default=None,
+    help=f"Override organization URL (default: parsed from URL or {DEFAULT_ORG}).",
+)
+@click.option(
+    "--project",
+    default=None,
+    help=f"Override project (default: parsed from URL or {DEFAULT_PROJECT}).",
+)
+@click.option(
+    "--out-dir",
+    default="reports",
+    show_default=True,
+    help="Output directory for the markdown file.",
+)
+@click.option(
+    "--out",
+    default=None,
+    help="Explicit output file path (overrides --out-dir naming).",
+)
+@click.option(
+    "--stdout",
+    "stdout",
+    is_flag=True,
+    help="Write the markdown to stdout instead of a file.",
+)
+@click.option(
+    "--children",
+    "--include-child",
+    "children",
+    is_flag=True,
+    help="Also render the direct children (first level only), e.g. a "
+    "Feature's child User Stories. Shorthand for --depth 1.",
+)
+@click.option(
+    "--depth",
+    type=int,
+    default=None,
+    help="How many hierarchy levels to descend and render. "
+    "1 = direct children, 2 = also grandchildren (e.g. an Epic's Features "
+    "AND their User Stories), etc. Overrides --children.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    help="Descend the entire child hierarchy (Epic -> Feature -> User Story "
+    "-> Task ...). Overrides --depth / --children.",
+)
+@click.option(
+    "--split",
+    is_flag=True,
+    help="Write one file per work item into --out-dir (e.g. EPIC-*.md, "
+    "FEATURE-*.md, US-*.md) instead of a single combined document. "
+    "Cannot be used with --stdout or --out.",
+)
+def cli_fetch_work(**kwargs: Any) -> None:
+    """Download a single work item as Markdown.
+
+    REF is a work item ID (e.g. 7102940) or a full URL
+    (e.g. https://dev.azure.com/<org>/<project>/_workitems/edit/7102940/).
+    """
+    raise SystemExit(cmd_fetch_work(Args(**kwargs)))
+
+
+@board_cli.command("work-status")
+@click.argument("ref")
+@click.option(
+    "--org",
+    default=None,
+    help=f"Override organization URL (default: parsed from URL or {DEFAULT_ORG}).",
+)
+@click.option(
+    "--project",
+    default=None,
+    help=f"Override project (default: parsed from URL or {DEFAULT_PROJECT}).",
+)
+@click.option(
+    "--children",
+    "--include-child",
+    "children",
+    is_flag=True,
+    help="Also report each direct child separately. Shorthand for --depth 1.",
+)
+@click.option(
+    "--depth",
+    type=int,
+    default=None,
+    help="How many hierarchy levels to report on individually "
+    "(1 = direct children, 2 = also grandchildren). Overrides --children.",
+)
+@click.option(
+    "--recursive",
+    is_flag=True,
+    help="Report on the entire child hierarchy. Overrides --depth / --children.",
+)
+@click.option(
+    "--releases-top",
+    type=int,
+    default=5,
+    show_default=True,
+    help="How many recent releases to inspect per pipeline.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Show the full PR list and per-release detail. Default is a summary per repo.",
+)
+def cli_work_status(**kwargs: Any) -> None:
+    """Show merge & deployment status for any work item (Task, Story, Feature, Epic...).
+
+    REF is a work item ID (e.g. 7102940) or a full URL
+    (e.g. https://dev.azure.com/<org>/<project>/_workitems/edit/7102940).
+    """
+    raise SystemExit(cmd_work_status(Args(**kwargs)))

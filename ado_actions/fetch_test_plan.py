@@ -5,7 +5,6 @@ Writes a JSON dump and one Markdown file per unique test case under
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -14,8 +13,11 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+import click
 from azure.devops.connection import Connection
 from msrest.authentication import BasicAuthentication
+
+from ado_actions.cliargs import Args
 
 
 # Org/project and repo/pipeline names are environment-specific and MUST NOT
@@ -374,7 +376,7 @@ def _print_suite_tree(
         _print_suite_tree(kid, children, new_prefix, i == len(kids) - 1, False)
 
 
-def cmd_show_plan(args: argparse.Namespace) -> int:
+def cmd_show_plan(args: Args) -> int:
     pat = get_pat()
     _, client, _ = get_clients(args.org, pat)
 
@@ -400,7 +402,7 @@ def cmd_show_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_show_story(args: argparse.Namespace) -> int:
+def cmd_show_story(args: Args) -> int:
     data = json.loads(Path(args.json).read_text())
     matches = [c for c in data if c.get("parent_id") == args.story_id]
     if not matches:
@@ -414,7 +416,7 @@ def cmd_show_story(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fetch(args: argparse.Namespace) -> int:
+def cmd_fetch(args: Args) -> int:
 
     out_json = Path(args.out_json or f"test_cases_plan_{args.plan_id}.json")
     md_dir = Path(args.md_dir or f"tests/plan-{args.plan_id}")
@@ -638,48 +640,51 @@ def _artifact_source_commit(artifact: Any) -> str | None:
     return cid or None
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="fetch_test_plan")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    f = sub.add_parser("fetch", help="Fetch a test plan and write JSON + per-case markdown.")
-    f.add_argument("--plan-id", type=int, required=True)
-    f.add_argument("--project", default=DEFAULT_PROJECT)
-    f.add_argument("--org", default=DEFAULT_ORG)
-    f.add_argument("--out-json", default=None)
-    f.add_argument("--md-dir", default=None)
-    f.add_argument(
-        "--group-by-story",
-        action="store_true",
-        help="Place markdown files in story-<parentId>/ subdirs based on TestedBy relation.",
-    )
-    f.add_argument(
-        "--include-story",
-        action="store_true",
-        help="Also write story-<id>-<title>.md (story definition) inside each story folder. Requires --group-by-story.",
-    )
-    f.set_defaults(func=cmd_fetch)
-
-    sp = sub.add_parser("show-plan", help="Show plan suite hierarchy (folders and test suites).")
-    sp.add_argument("--plan-id", type=int, required=True)
-    sp.add_argument("--project", default=DEFAULT_PROJECT)
-    sp.add_argument("--org", default=DEFAULT_ORG)
-    sp.add_argument(
-        "--folder-id",
-        type=int,
-        default=None,
-        help="Show only the subtree rooted at this folder/suite id.",
-    )
-    sp.set_defaults(func=cmd_show_plan)
-
-    s = sub.add_parser("show-story", help="List test cases for one user story from a JSON dump.")
-    s.add_argument("story_id", type=int)
-    s.add_argument("--json", default="test_cases_plan_1001.json")
-    s.set_defaults(func=cmd_show_story)
-
-    args = p.parse_args()
-    return args.func(args)
+@click.group("testing")
+def testing_cli() -> None:
+    """Test plans, suites and test cases."""
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+@testing_cli.command("fetch")
+@click.option("--plan-id", type=int, required=True)
+@click.option("--project", default=DEFAULT_PROJECT, show_default=True)
+@click.option("--org", default=DEFAULT_ORG, show_default=True)
+@click.option("--out-json", default=None)
+@click.option("--md-dir", default=None)
+@click.option(
+    "--group-by-story",
+    is_flag=True,
+    help="Place markdown files in story-<parentId>/ subdirs based on TestedBy relation.",
+)
+@click.option(
+    "--include-story",
+    is_flag=True,
+    help="Also write story-<id>-<title>.md (story definition) inside each story folder. "
+    "Requires --group-by-story.",
+)
+def cli_fetch(**kwargs: Any) -> None:
+    """Fetch a test plan and write JSON + per-case markdown."""
+    raise SystemExit(cmd_fetch(Args(**kwargs)))
+
+
+@testing_cli.command("show-plan")
+@click.option("--plan-id", type=int, required=True)
+@click.option("--project", default=DEFAULT_PROJECT, show_default=True)
+@click.option("--org", default=DEFAULT_ORG, show_default=True)
+@click.option(
+    "--folder-id",
+    type=int,
+    default=None,
+    help="Show only the subtree rooted at this folder/suite id.",
+)
+def cli_show_plan(**kwargs: Any) -> None:
+    """Show plan suite hierarchy (folders and test suites)."""
+    raise SystemExit(cmd_show_plan(Args(**kwargs)))
+
+
+@testing_cli.command("show-story")
+@click.argument("story_id", type=int)
+@click.option("--json", "json_", default="test_cases_plan_1001.json", show_default=True)
+def cli_show_story(story_id: int, json_: str) -> None:
+    """List test cases for one user story from a JSON dump."""
+    raise SystemExit(cmd_show_story(Args(story_id=story_id, json=json_)))

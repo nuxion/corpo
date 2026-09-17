@@ -12,13 +12,11 @@ classifiers = [
 ]
 dependencies = [
     "azure-devops>=7.1.0b4",
+    "click>=8.1",
 ]
 
 [project.scripts]
-ado = "ado_actions.fetch_test_plan:main"
-board = "ado_actions.board:main"
-repo = "ado_actions.repo:main"
-pipeline = "ado_actions.pipeline:main"
+ado = "ado_actions.cli:cli"
 
 [build-system]
 requires = ["hatchling"]
