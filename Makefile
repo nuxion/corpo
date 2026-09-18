@@ -11,6 +11,7 @@ Commands:
 	docker    Build the docker image
 	tag    	  Make a git tab using poetry information
 	zipapps   Build standalone `board` and `pipeline` executables with shiv
+	release   Bump version, tag, and build the release zipapp (RELEASE_VERSION=x.y.z)
 
 endef
 
@@ -95,4 +96,28 @@ build:
 
 publish:
 	echo "Not implemented"
+
+## Release
+
+RELEASE_VERSION ?=
+
+.PHONY: bump-version release
+bump-version:
+	@if [ -z "$(RELEASE_VERSION)" ]; then echo "Usage: make bump-version RELEASE_VERSION=x.y.z"; exit 1; fi
+	uv version $(RELEASE_VERSION)
+	sed -i "s/__version__ = '.*'/__version__ = '$(RELEASE_VERSION)'/" ado_actions/__about__.py
+	git add pyproject.toml uv.lock ado_actions/__about__.py
+	git commit -m "release v$(RELEASE_VERSION)"
+	git tag v$(RELEASE_VERSION)
+
+release:
+	@if [ -z "$(RELEASE_VERSION)" ]; then echo "Usage: make release RELEASE_VERSION=x.y.z"; exit 1; fi
+	$(MAKE) bump-version RELEASE_VERSION=$(RELEASE_VERSION)
+	$(MAKE) clean
+	$(MAKE) zipapps
+	./$(SHIV_OUT)/ado --version
+	@echo ""
+	@echo "Build OK. Review the commit/tag, then finish the release with:"
+	@echo "  git push && git push --tags"
+	@echo "  gh release create v$(RELEASE_VERSION) $(SHIV_OUT)/ado --notes '...'"
 
