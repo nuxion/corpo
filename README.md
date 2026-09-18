@@ -1,20 +1,15 @@
 # ado_actions
 
-[![PyPI - Version](https://img.shields.io/pypi/v/ado_actions.svg)](https://pypi.org/project/ado_actions)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/ado_actions.svg)](https://pypi.org/project/ado_actions)
-
------
-
-## Description
-
-Tools for working with Azure DevOps Test Plans. The main entry point is
-`ado_actions.fetch_test_plan`, which downloads every test case from a
-Test Plan, dumps them to JSON, and writes one Markdown file per case
-(optionally grouped by parent User Story, optionally including the
-story definition itself).
+Tools for working with Azure DevOps: fetching Test Plans, reporting on
+work items and their PR/release status, and driving builds, releases
+and deployments — all from one `ado` CLI.
 
 For background on Plan / Suite / Test Case / User Story IDs and how
-they relate, see [`test-suite.md`](./test-suite.md).
+they relate, see [`test-suite.md`](./test-suite.md). For the full
+command reference (every `board` and `pipeline` flag, with examples),
+see [`ado.spec.md`](./ado.spec.md).
+
+-----
 
 ## Setup
 
@@ -74,9 +69,9 @@ after `uv sync`, directly as `ado`.
 Every level has `--help`, e.g. `ado testing --help` or
 `ado board work-status --help`.
 
-### Fetch a whole plan
+### Test plans (`ado testing`)
 
-Basic — flat output, one markdown per test case:
+Fetch a whole plan — flat output, one markdown per test case:
 
 ```fish
 uv run ado testing fetch --plan-id 1001
@@ -119,33 +114,24 @@ Flags:
 | `--group-by-story` | off | Subdirs `story-<parentId>/` via TestedBy relation |
 | `--include-story` | off | Also write the User Story definition (requires `--group-by-story`) |
 
-### Show the suite hierarchy of a plan
-
-Print the folder/suite tree of a plan without fetching test cases —
+Show the suite hierarchy of a plan without fetching test cases —
 useful for finding a `--folder-id` to scope a later run, or just
 auditing how a plan is organised:
 
 ```fish
 uv run ado testing show-plan --plan-id 1001
-```
-
-Limit the tree to one subtree:
-
-```fish
+# limit to one subtree:
 uv run ado testing show-plan --plan-id 1001 --folder-id 2004
 ```
 
 Each line is prefixed with `[F]` for folder/static suites and `[S]`
 for other suite types.
 
-### Inspect a single User Story from the JSON
-
 After running `fetch`, query the resulting JSON for one story without
 hitting the API again:
 
 ```fish
-uv run ado testing show-story 11336 \
-  --json test_cases_plan_1001.json
+uv run ado testing show-story 11336 --json test_cases_plan_1001.json
 ```
 
 Sample output:
@@ -158,86 +144,92 @@ Story 11336: Export Requests to Excel (model+support)
    …
 ```
 
+### Sprints and work items (`ado board`)
 
-### Work item status (`ado board work-status`)
-
-Merge & deployment state for **any** work item — Task, Bug, User Story,
-Feature or Epic. It walks the item's whole subtree for linked Pull
-Requests, checks which ones landed on `dev`, and matches their merge
-commits against the artifacts of recent releases to tell you which
-environments already carry the work.
-
-Takes an id or a full work-item URL (org and project are inferred from
-the URL):
+`fetch-work` downloads a single work item (and optionally its
+children) as Markdown; `sprint` and `work-status` both merge PR and
+release data to show which environments already carry a piece of
+work — `sprint` for every story in an iteration, `work-status` for one
+work item (Task, Bug, User Story, Feature or Epic) and, optionally,
+its subtree:
 
 ```fish
-uv run ado board work-status 7638343
+uv run ado board fetch-work 7102940
+uv run ado board sprint
+uv run ado board work-status 7638343 --recursive
+```
+
+`work-status` takes an id or a full work-item URL (org and project are
+inferred from the URL):
+
+```fish
 uv run ado board work-status https://dev.azure.com/<org>/<project>/_workitems/edit/7638343
 ```
 
-Report on the hierarchy below the item as well — same flags as
-`ado board fetch-work`:
+(`work-status` replaces the old `ado story-status`, which was
+story-only.) See `ado board <command> --help` or
+[`ado.spec.md`](./ado.spec.md) for the full flag reference and more
+examples.
+
+### Builds, releases and deployments (`ado pipeline`)
 
 ```fish
-uv run ado board work-status 7291258 --children      # each direct child too
-uv run ado board work-status 7291258 --depth 2       # children and grandchildren
-uv run ado board work-status 7291258 --recursive     # the whole tree
+uv run ado pipeline build Nexus-FrontEnd-CI --branch dev --watch
+uv run ado pipeline release EXAMPLE-API-CD --manual
+uv run ado pipeline deploy EXAMPLE-API-CD --env QA --watch
+uv run ado pipeline watch <build-or-release-id>
 ```
 
-| Flag | Default | Notes |
-|------|---------|-------|
-| `ref` | _(required)_ | Work item id or `_workitems/edit/<id>` URL |
-| `--org` / `--project` | parsed from the URL, else env | Override the inferred context |
-| `--children` | off | Also report each direct child (alias `--include-child`) |
-| `--depth N` | — | Report N levels down; overrides `--children` |
-| `--recursive` | off | Whole child hierarchy; overrides `--depth` |
-| `--releases-top` | 5 | Recent releases inspected per pipeline |
-| `-v`, `--verbose` | off | Full PR list and per-release detail |
+Deployment/release commands rely on `AZDO_BACKEND_RELEASE_DEF` /
+`AZDO_FRONTEND_RELEASE_DEF` (see [Setup](#2-set-your-azure-devops-environment)).
+See `ado pipeline <command> --help` or [`ado.spec.md`](./ado.spec.md)
+for the full flag reference and more examples.
 
-Deployment lines only appear for the repos named by `AZDO_BACKEND_REPO`
-/ `AZDO_FRONTEND_REPO` and their `*_RELEASE_DEF` pipelines. PRs found in
-any other repo are still summarised, just without release data.
+### Pull request review (`ado repo`)
 
-(This command replaces the old `ado story-status`, which was
-story-only.)
+Review an ADO pull request with an AI agent, run from a disposable git
+worktree of the PR's branch:
 
-## Features
-
-- Makefile for common tasks
-- Sphinx 
-- pytest
-- `.gitignore` for python + nodejs projects + emacs + vim + vscode (using topal gitignore generation tool)
-- jupyter as optional dependency + jupytext
-- linting tools
-
-## Dependencies
-
-Dependencies are handled by [uv->dependencies](https://docs.astral.sh/uv/concepts/projects/dependencies/#changing-dependencies)
-
-Adding a main dependency:
-
-```
-uv add flask
+```fish
+uv run ado repo review https://dev.azure.com/<org>/<proj>/_git/<repo>/pullrequest/<id>
 ```
 
-Add dev dependency
+Use `--copilot` instead of the default `claude` CLI, or pass `--repo`
+/ `--pr` in place of a URL. See `ado repo review --help` for the rest
+of the flags.
 
-```
-uv add --dev ruff
+## Development
+
+- `make` — see `make help` for the available tasks (build zipapps,
+  clean build artifacts, etc.).
+- `pytest` for tests, `ruff check` for linting.
+- `.gitignore` covers python, node, emacs, vim and vscode (generated
+  with the [toptal gitignore tool](https://www.toptal.com/developers/gitignore)).
+
+Dependencies are handled by [uv](https://docs.astral.sh/uv/concepts/projects/dependencies/#changing-dependencies):
+
+```fish
+uv add flask          # main dependency
+uv add --dev ruff      # dev dependency
+uv sync --locked       # fresh install
+uv export --format requirements-txt   # export
 ```
 
-Fresh install: 
-```
-uv sync --locked
-```
+## Releases
 
-Export:
-```
-uv export --format requirements-txt
+`ado` ships as a single-file executable built with
+[shiv](https://github.com/linkedin/shiv) and published as a GitHub
+Release asset — there is no PyPI package. See
+[`RELEASE.md`](./RELEASE.md) for the full release process, or run:
+
+```fish
+make release RELEASE_VERSION=x.y.z
 ```
 
 ## References
 
+- [`ado.spec.md`](./ado.spec.md) — full CLI specification
+- [`RELEASE.md`](./RELEASE.md) — release process
 - https://waylonwalker.com/hatch-version/
 
 ## License
